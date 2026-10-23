@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg
+
+# Runtime / local state (never commit)
+output/
+Rawdatabase/
+updates/_staging/
+tmp/
+Troubleshootings/
+
+# Workspace-only: Claude duplicate of internal rules; draft user guide
+# (screenshots can contain machine-local paths)
+CLAUDE.md
+docs/user-guide/
+source/_verify_*.py
+
+# Release binaries (publish via GitHub Releases, not git)
+*.zip
+smartLarch-Platform_Windows_*.zip
+smartLarch-Platform_macOS_*.zip
+
+# OS / editor
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+*.code-workspace
+
+# Local secrets / env (if ever added)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Qt / local machine
+*.user
+*.pro.user
+
+# Eng-mode draft clutter (keep layout.current.json only if desired)
+# ui/layout.export-*.json
+
+# Logs
+*.log
+gui_errors.log
+launch_log.txt
+
+# Eng-mode draft exports (layout.current.json is the tracked snapshot)
+ui/layout.export-*.json
+
+# Maintainer-only sanitizer (names the internal needles it strips) - never publish
+scripts/Sync-From-Workspace.ps1

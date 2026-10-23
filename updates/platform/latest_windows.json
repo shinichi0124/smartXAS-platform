@@ -1,0 +1,9 @@
+{
+  "name": "smartLarch Platform",
+  "version": "4.4.1",
+  "os": "windows",
+  "path": "smartLarch-Platform_Windows_v4.4.1.zip",
+  "sha256": "684c6a940cff66f253e55d97ddbf784a23a5f9184e29e3d14d1332bf22098a88",
+  "generated_at": "2026-10-23T09:10:01Z",
+  "notes": "Zip is at project root. Plugins update separately under plugins/."
+}

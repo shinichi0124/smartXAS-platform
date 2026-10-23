@@ -1,0 +1,167 @@
+{
+  "schema": "sa-ui-layout/v1",
+  "app": "smartLarch Platform",
+  "version": "2.16.18",
+  "surface": "main",
+  "mode": "draft-export",
+  "apply_mode": "agent-source-only",
+  "exported_at": "2026-10-15T13:31:00Z",
+  "user_notes": "GDS/FEFF tables equal height; no empty gap under Fit panel",
+  "notes": "GDS/FEFF tables equal height; no empty gap under Fit panel",
+  "baseline": {
+    "left_w": 260,
+    "right_w": 340,
+    "log_h": 110,
+    "main_sizes": [
+      260,
+      832,
+      340
+    ],
+    "window": {
+      "w": 1440,
+      "h": 880,
+      "min_w": 1180,
+      "min_h": 700,
+      "x": 2,
+      "y": 2
+    }
+  },
+  "agent_instructions": "Engineering draft export (UI was NOT live-mutated). 1) Read user_notes first. 2) Apply panels/splitters/widgets/text to production SOURCE (main_window.py geometry constants + i18n STRINGS). 3) Do not expect the running app to already match draft sizes. 4) Bump APP_VERSION; sync layout.current.json; quit GUI.",
+  "window": {
+    "w": 1440,
+    "h": 880,
+    "min_w": 1180,
+    "min_h": 700,
+    "x": 2,
+    "y": 2
+  },
+  "panels": {
+    "left": {
+      "id": "panel.left",
+      "baseline_w": 260,
+      "live_w": 260,
+      "w": 300,
+      "min_w": 260,
+      "max_w": 330,
+      "recommended_fixed_band": [
+        280,
+        320
+      ]
+    },
+    "right": {
+      "id": "panel.right",
+      "baseline_w": 340,
+      "live_w": 340,
+      "w": 340,
+      "min_w": 340,
+      "max_w": 460,
+      "recommended_fixed_band": [
+        320,
+        360
+      ]
+    },
+    "log": {
+      "id": "panel.log",
+      "baseline_h": 110,
+      "live_h": 110,
+      "h": 150,
+      "min_h": 60,
+      "max_h": 150
+    }
+  },
+  "splitters": {
+    "main": {
+      "orientation": "horizontal",
+      "baseline_sizes": [
+        260,
+        832,
+        340
+      ],
+      "sizes": [
+        300,
+        792,
+        340
+      ],
+      "stretch": [
+        0,
+        1,
+        0
+      ],
+      "code_hook": "main_window._build_ui → split.setSizes"
+    },
+    "fit_display": {
+      "orientation": "vertical",
+      "baseline_sizes": [
+        605,
+        0
+      ],
+      "sizes": [
+        605,
+        0
+      ],
+      "stretch": [
+        4,
+        1
+      ],
+      "code_hook": "main_window.fit_display_splitter"
+    }
+  },
+  "widgets": {
+    "ghostBtn": {
+      "ui_id": "ghostBtn",
+      "class": "QPushButton",
+      "path": "QWidget/headerBand/ghostBtn",
+      "baseline_w": 60,
+      "baseline_h": 24,
+      "w": 100,
+      "h": 28,
+      "min_w": 100,
+      "max_w": 100,
+      "min_h": 28,
+      "max_h": 28,
+      "fixed": true,
+      "draft_only": true,
+      "apply": "agent-source",
+      "text": "保存",
+      "font_pt": 9
+    }
+  },
+  "text": {},
+  "code_hooks": {
+    "main_splitter_sizes": {
+      "file": "source/app/main_window.py",
+      "symbol": "split.setSizes",
+      "note": "Update setSizes([...]) to splitters.main.sizes"
+    },
+    "left_panel_width": {
+      "file": "source/app/main_window.py",
+      "symbol": "left.setMinimumWidth / left.setMaximumWidth",
+      "note": "Use panels.left.w for production min/max band"
+    },
+    "right_panel_width": {
+      "file": "source/app/main_window.py",
+      "symbol": "right.setMinimumWidth / right.setMaximumWidth",
+      "note": "Use panels.right.w"
+    },
+    "log_height": {
+      "file": "source/app/main_window.py",
+      "symbol": "txt_log.setMaximumHeight / setMinimumHeight",
+      "note": "Use panels.log.h"
+    },
+    "window_size": {
+      "file": "source/app/main_window.py",
+      "symbol": "self.resize / setMinimumSize",
+      "note": "Use window.w/h and min_*"
+    },
+    "i18n_text": {
+      "file": "source/app/i18n.py",
+      "symbol": "STRINGS",
+      "note": "Apply text entries with i18n:<key> to both zh and en"
+    },
+    "picked_widgets": {
+      "file": "source/app/main_window.py",
+      "symbol": "setFixedWidth/Height or min/max on named controls",
+      "note": "Apply widgets.* draft w/h by ui_id / path / text label"
+    }
+  }
+}
