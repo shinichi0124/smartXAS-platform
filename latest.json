@@ -1,19 +1,19 @@
 {
   "name": "smartLarch Platform",
-  "version": "4.4.1",
+  "version": "4.5.0",
   "packages": {
     "windows": {
       "os": "windows",
-      "version": "4.4.1",
-      "path": "smartLarch-Platform_Windows_v4.4.1.zip",
-      "sha256": "684c6a940cff66f253e55d97ddbf784a23a5f9184e29e3d14d1332bf22098a88"
+      "version": "4.5.0",
+      "path": "smartLarch-Platform_Windows_v4.5.0.zip",
+      "sha256": "c1d26ac233bcd3ce7539098c81ceeda4cd4b99b3e1aefa8ea3d957142efb8bf8"
     },
     "macos": {
       "os": "macos",
-      "version": "4.4.1",
-      "path": "smartLarch-Platform_macOS_v4.4.1.zip",
-      "sha256": "ebd67d333d6c2d60b166bf3d57b56a2cd18187b6412d1415ae26be3aa060493d"
+      "version": "4.5.0",
+      "path": "smartLarch-Platform_macOS_v4.5.0.zip",
+      "sha256": "a32cfb4e2d72ba8e823dc76402ea68188f2097b29551c7866503f02cc083fc0a"
     }
   },
-  "generated_at": "2026-10-23T09:10:01Z"
+  "generated_at": "2026-10-23T12:40:23Z"
 }
