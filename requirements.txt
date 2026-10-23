@@ -1,0 +1,16 @@
+# Logical runtime dependencies for smartLarch Platform.
+# Prefer conda-forge + official xraylarch install, or run Install-Runtime.ps1 / .sh.
+# Pinning is release-specific inside Install-Runtime scripts.
+
+# Core (conda-forge / xraylarch stack)
+# xraylarch
+# PySide6
+# matplotlib
+# numpy
+# scipy
+
+# Optional analysis (Install-Runtime also pip-installs this)
+pymcr>=0.5.1
+
+# Dev / test helpers (optional)
+# pytest

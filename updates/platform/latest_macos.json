@@ -1,0 +1,9 @@
+{
+  "name": "smartLarch Platform",
+  "version": "4.4.1",
+  "os": "macos",
+  "path": "smartLarch-Platform_macOS_v4.4.1.zip",
+  "sha256": "ebd67d333d6c2d60b166bf3d57b56a2cd18187b6412d1415ae26be3aa060493d",
+  "generated_at": "2026-10-23T09:10:01Z",
+  "notes": "Zip is at project root. Plugins update separately under plugins/."
+}
