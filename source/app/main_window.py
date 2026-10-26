@@ -2272,6 +2272,10 @@ class MainWindow(QMainWindow):
         self.btn_settings.setObjectName("iconBtn")
         self.btn_settings.setFixedSize(32, 32)
         self.btn_settings.clicked.connect(self._open_settings)
+        self.btn_user_guide = QPushButton("?")
+        self.btn_user_guide.setObjectName("iconBtn")
+        self.btn_user_guide.setFixedSize(32, 32)
+        self.btn_user_guide.clicked.connect(self._open_user_guide)
         # File tools live right-aligned on the header row, left of ⚙ — no
         # separate toolbar band (saves a full row of vertical space).
         self.btn_open = QPushButton()
@@ -2318,6 +2322,7 @@ class MainWindow(QMainWindow):
         hh.addWidget(self.btn_quick_prj_dir)
         hh.addWidget(self.btn_save)
         hh.addWidget(self.btn_settings)
+        hh.addWidget(self.btn_user_guide)
         v.addWidget(header)
 
         self.setAcceptDrops(True)
@@ -3665,6 +3670,8 @@ class MainWindow(QMainWindow):
         self.lbl_app_sub.setText(t("app_subtitle"))
         self.btn_settings.setToolTip(t("settings_tip"))
         self.btn_settings.setText("⚙")
+        self.btn_user_guide.setToolTip(t("user_guide_tip"))
+        self.btn_user_guide.setAccessibleName(t("user_guide_tip"))
         if self._tray is not None:
             self._tray.setToolTip(f"{APP_NAME} v{APP_VERSION}")
             self._refresh_tray_menu()
@@ -12612,6 +12619,19 @@ class MainWindow(QMainWindow):
         if configured:
             return Path(configured).expanduser()
         return plugins_manager.default_plugins_dir(self.paths)
+
+    def _user_guide_path(self) -> Path:
+        return Path(self.paths["root"]) / "docs" / "user-guide" / "USER_GUIDE.html"
+
+    def _open_user_guide(self) -> None:
+        """Header ? button: the packaged HTML guide in the system browser."""
+        path = self._user_guide_path()
+        if not path.is_file():
+            QMessageBox.information(
+                self, self.i18n.t("user_guide_tip"), self.i18n.t("user_guide_missing", path=str(path))
+            )
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
 
     def _open_plugins_folder(self) -> None:
         d = self._plugins_dir()

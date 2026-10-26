@@ -1,9 +1,9 @@
 {
   "name": "smartLarch Platform",
-  "version": "4.5.0",
+  "version": "4.6.0",
   "os": "macos",
-  "path": "smartLarch-Platform_macOS_v4.5.0.zip",
-  "sha256": "a32cfb4e2d72ba8e823dc76402ea68188f2097b29551c7866503f02cc083fc0a",
-  "generated_at": "2026-10-23T12:40:23Z",
+  "path": "smartLarch-Platform_macOS_v4.6.0.zip",
+  "sha256": "047a9b005c018ec06367a2a756ccaecc916610285cee19530d818debd2374263",
+  "generated_at": "2026-10-26T04:27:02Z",
   "notes": "Zip is at project root. Plugins update separately under plugins/."
 }

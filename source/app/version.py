@@ -1,5 +1,5 @@
 # Single source of truth for app version (must match docs / launchers).
-APP_VERSION = "4.5.0"
+APP_VERSION = "4.6.0"
 APP_NAME = "smartLarch Platform"
 APP_NAME_CN = "smartLarch Platform · Athena工作区 + Larch拟合"
 # QSettings application name (no spaces). Legacy key kept for one-shot migration.

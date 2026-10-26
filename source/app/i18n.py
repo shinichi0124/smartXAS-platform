@@ -30,6 +30,14 @@ STRINGS = {
         "zh": "设置（语言 / 编码助手 / 升级 / 托盘 / 关于）",
         "en": "Settings (language / coding agents / updates / tray / about)",
     },
+    "user_guide_tip": {
+        "zh": "用户手册（英文，在浏览器中打开）",
+        "en": "User guide (opens in your browser)",
+    },
+    "user_guide_missing": {
+        "zh": "找不到用户手册：\n{path}\n\n手册随安装包提供（docs/user-guide/USER_GUIDE.html）；源码版不含手册。",
+        "en": "The user guide was not found:\n{path}\n\nIt ships in the installer zip (docs/user-guide/USER_GUIDE.html); the source-only build does not include it.",
+    },
     "settings_auto_saved": {
         "zh": "更改将自动保存。",
         "en": "Changes are saved automatically.",
