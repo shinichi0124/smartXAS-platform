@@ -454,8 +454,12 @@ def single_phase_search(
     s02_free: bool,
     try_ms: bool,
     windows=None,
+    cn_free: bool = False,
 ) -> SearchResult:
-    """Single-phase model, optionally testing multiple scattering."""
+    """Single-phase model, optionally testing multiple scattering.
+
+    cn_free (v5.1.0): one CN factor scales every N (see single_phase_model).
+    """
     from . import feff_build
     from .fit_audit import audit_fit, verdict as _verdict
     from .fit_engine import hamilton_test
@@ -465,7 +469,7 @@ def single_phase_search(
         raise ValueError("windows are required to build the model")
     try:
         gds, paths, report = feff_build.single_phase_model(
-            entry_paths, s02, s02_free, windows, include_ms=False
+            entry_paths, s02, s02_free, windows, include_ms=False, cn_free=cn_free
         )
     except Exception as exc:
         result.all_failed = True
@@ -482,7 +486,7 @@ def single_phase_search(
     if try_ms:
         try:
             gds_ms, paths_ms, report_ms = feff_build.single_phase_model(
-                entry_paths, s02, s02_free, windows, include_ms=True
+                entry_paths, s02, s02_free, windows, include_ms=True, cn_free=cn_free
             )
         except Exception as exc:
             result.steps.append({"step": 2, "tried": [{"tag": "MS", "error": str(exc)}], "chosen": ""})

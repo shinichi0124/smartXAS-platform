@@ -123,7 +123,11 @@ class FitResult:
     gds_used: List[Any] = field(default_factory=list)
 
     def to_text(self) -> str:
-        lines = [self.report_text or "", ""]
+        lines = []
+        shell_text = format_shell_table(self) if self.ok else ""
+        if shell_text:
+            lines += [shell_text, ""]
+        lines += [self.report_text or "", ""]
         if self.audit:
             # v4.9.0: the parameter audit is part of every fit report.
             lines.append("=== Parameter audit ===")
@@ -1539,10 +1543,20 @@ def _path_infos(feff_paths, out, params_out: Dict[str, Any], dset) -> List[Dict[
             except Exception:
                 return None
 
+        def _fe_err(name: str):
+            try:
+                return float(drep.get(f"{name}_stderr"))
+            except Exception:
+                return float("nan")
+
         dr_v, dr_e = (0.0, 0.0)
         expr = (pd.deltar or "").strip()
         if expr in params_out:
             dr_v, dr_e = params_out[expr]["value"], params_out[expr]["stderr"]
+        else:  # an expression (alpha*reff): larch propagated the error (v5.1.0)
+            r_err = _fe_err("r")
+            if np.isfinite(r_err):
+                dr_e = r_err
         deltar_v = _fe("deltar")
         if deltar_v is not None:
             r_v = reff + deltar_v if np.isfinite(reff) else float("nan")
@@ -1555,15 +1569,106 @@ def _path_infos(feff_paths, out, params_out: Dict[str, Any], dset) -> List[Dict[
                 "reff": reff,
                 "degen": float(getattr(fp, "degen", pd.degen or float("nan"))),
                 "s02": _fe("s02"),
+                "s02_err": _fe_err("s02"),
                 "e0": _fe("e0"),
                 "deltar": deltar_v,
                 "sigma2": _fe("sigma2"),
+                "sigma2_err": _fe_err("sigma2"),
                 "r": r_v,
                 "r_err": dr_e,
                 "exprs": {"s02": pd.s02, "e0": pd.e0, "deltar": pd.deltar, "sigma2": pd.sigma2},
             }
         )
     return path_infos
+
+
+def _num_or_nan(value) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    return out
+
+
+def shell_rows(result) -> List[Dict[str, Any]]:
+    """Per fitted path: coordination number, R and sigma^2 with errors (v5.1.0).
+
+    The path amplitude is N*S0^2 = degen * (evaluated s02 expression).  CN is
+    that over S0^2 when the expression uses exactly one s02_* parameter; its
+    error is propagated only when S0^2 is fixed (a fitted S0^2 with a fitted N
+    would need the covariance).  ``cn_fixed`` marks an amplitude with no free
+    parameter (N held at the crystallographic value).
+    """
+    params = dict(getattr(result, "params", {}) or {})
+    rows: List[Dict[str, Any]] = []
+    for p in getattr(result, "paths", None) or []:
+        degen = _num_or_nan(p.get("degen"))
+        amp = _num_or_nan(p.get("s02"))
+        amp_err = _num_or_nan(p.get("s02_err"))
+        expr = str((p.get("exprs") or {}).get("s02") or "")
+        names = _expr_names(expr)
+        s02_names = [n for n in names if n.lower().startswith("s02") and n in params]
+        free = [n for n in names if n in params and str(params[n].get("kind")) == "vary"]
+        cn = cn_err = float("nan")
+        s02_value = float("nan")
+        if len(s02_names) == 1:
+            info = params[s02_names[0]]
+            s02_value = _num_or_nan(info.get("value"))
+            if np.isfinite(s02_value) and s02_value > 0:
+                cn = degen * amp / s02_value
+                if str(info.get("kind")) != "vary" and np.isfinite(amp_err):
+                    cn_err = degen * amp_err / s02_value
+        rows.append(
+            {
+                "label": p.get("label", ""),
+                "reff": _num_or_nan(p.get("reff")),
+                "n_s02": degen * amp,
+                "cn": cn,
+                "cn_err": cn_err,
+                # S0^2 alone free (a standard) still leaves N at the bulk value
+                "cn_fixed": not [n for n in free if not n.lower().startswith("s02")],
+                "s02": s02_value,
+                "r": _num_or_nan(p.get("r")),
+                "r_err": _num_or_nan(p.get("r_err")),
+                "sigma2": _num_or_nan(p.get("sigma2")),
+                "sigma2_err": _num_or_nan(p.get("sigma2_err")),
+            }
+        )
+    return rows
+
+
+def _pm(value: float, err: float, fmt: str) -> str:
+    if not np.isfinite(value):
+        return "—"
+    text = format(value, fmt)
+    if np.isfinite(err) and err > 0:
+        text += " ± " + format(err, fmt)
+    return text
+
+
+def format_shell_table(result) -> str:
+    """'=== Shells ===' block for the fit report (CN, R, sigma^2 per path)."""
+    rows = shell_rows(result)
+    if not rows:
+        return ""
+    lines = ["=== Shells: CN, R, sigma^2 (per path) ==="]
+    lines.append(f"  {'path':<22s} {'CN':<18s} {'R (A)':<20s} {'sigma^2 (A^2)':<20s}")
+    for row in rows:
+        if np.isfinite(row["cn"]):
+            cn = _pm(row["cn"], row["cn_err"], ".2f") + (" (fixed)" if row["cn_fixed"] else "")
+        else:
+            cn = "N*S0^2 " + _pm(row["n_s02"], float("nan"), ".3f")
+        lines.append(
+            f"  {str(row['label'])[:22]:<22s} {cn:<18s} "
+            f"{_pm(row['r'], row['r_err'], '.4f'):<20s} {_pm(row['sigma2'], row['sigma2_err'], '.5f'):<20s}"
+        )
+    s02s = sorted({round(r["s02"], 4) for r in rows if np.isfinite(r["s02"])})
+    if s02s:
+        lines.append(
+            "  CN = N*S0^2 / S0^2 with S0^2 = " + ", ".join(f"{v:g}" for v in s02s)
+            + "; (fixed) = N not fitted"
+        )
+    return "\n".join(lines)
 
 
 def _arr(obj, name):

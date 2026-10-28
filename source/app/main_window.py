@@ -146,6 +146,7 @@ from .fit_engine import (
     prepare_model_a_paths,
     project_paths,
     run_feffit,
+    shell_rows,
     run_feffit_multi,
     save_fit_to_history,
 )
@@ -5319,13 +5320,51 @@ class MainWindow(QMainWindow):
             return
         self._cif_path_dialog(paths)
 
+    def _cif_edge_checked(self, entries, cur) -> list:
+        """Structures whose absorption edge matches the current group (v5.1.0).
+
+        FEFF paths carry the edge's core hole: K-edge paths on L3 data give
+        wrong phase shifts.  Mismatched structures are re-set to the group's
+        edge (their FEFF runs are cleared so they run again) when the user
+        agrees; otherwise they are left out.
+        """
+        edge = str(getattr(cur, "edge", "") or "").strip()
+        if not edge:
+            return list(entries)
+        wrong = [e for e in entries if str(e.edge or "").strip().upper() != edge.upper()]
+        if not wrong:
+            return list(entries)
+        names = ", ".join(f"{e.label} ({e.edge or '?'})" for e in wrong[:6])
+        answer = QMessageBox.question(
+            self,
+            self.i18n.t("box_cif"),
+            self.i18n.t("edge_mismatch_ask", edge=edge, names=names, n=len(wrong)),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self._log(f"edge mismatch: left out {len(wrong)} structure(s) not at {edge}")
+            return [e for e in entries if e not in wrong]
+        for entry in wrong:
+            entry.edge = edge
+            entry.runs = []
+            entry.status = "pending"
+            entry.error = ""
+            getattr(self, "_cif_counts", {}).pop(entry.key, None)
+            getattr(self, "_cif_meta_cache", {}).pop(entry.key, None)
+        self._cif_save()
+        self._cif_refresh_table()
+        self._log(f"edge mismatch: {len(wrong)} structure(s) set to {edge}; FEFF runs again")
+        return list(entries)
+
     def _cif_quick_check(self) -> None:
         """Quick check (v4.11.0): which ticked structure looks like the data.
 
-        One minimal single-phase fit per structure — N fixed at the
-        crystallographic value, S0² fixed, single scattering only — ranked by
-        R-factor. The GDS and path tables are left alone; Auto fit builds and
-        fits the real model.
+        One minimal single-phase fit per structure — single scattering only,
+        S0² fixed, one shared CN factor (v5.1.0: a fixed bulk N made the ranking
+        a contest of amplitudes, not of structures) — ranked by reduced χ²,
+        which charges structures with more shells for their extra σ². The GDS
+        and path tables are left alone; Auto fit builds and fits the real model.
         """
         cur = self._fit_ready_current()
         if cur is None:
@@ -5335,6 +5374,9 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self, self.i18n.t("box_cif"), self.i18n.t("qc_need_marked")
             )
+            return
+        entries = self._cif_edge_checked(entries, cur)
+        if not entries:
             return
         self._cif_run_feff(entries=entries)
         entries = [e for e in entries if e.runs]
@@ -5361,10 +5403,12 @@ class MainWindow(QMainWindow):
                         False,
                         False,
                         windows=windows,
+                        cn_free=True,
                     )
                     tried = (search.steps[0].get("tried") or [{}])[0] if search.steps else {}
                     result = tried.get("result")
                     st = dict(getattr(result, "statistics", {}) or {})
+                    shells = shell_rows(result) if result is not None and getattr(result, "ok", False) else []
                     row.update(
                         {
                             "ok": bool(tried.get("ok")),
@@ -5372,6 +5416,14 @@ class MainWindow(QMainWindow):
                             "chi_square": tried.get("chi_square"),
                             # run_feffit says "redchi"; the Model A runner "reduced_chi_square"
                             "redchi": st.get("redchi", st.get("reduced_chi_square")),
+                            "n_varys": st.get("n_varys"),
+                            "cn1": shells[0]["cn"] if shells else None,
+                            "cn1_err": shells[0]["cn_err"] if shells else None,
+                            "n0_1": (
+                                float((tried.get("report") or {}).get("shells", [{}])[0].get("degen"))
+                                if (tried.get("report") or {}).get("shells")
+                                else None
+                            ),
                             "audit_level": str(tried.get("audit_verdict") or ""),
                             "flags": list(tried.get("flags") or []),
                             "error": str(tried.get("error") or search.error or ""),
@@ -5384,12 +5436,15 @@ class MainWindow(QMainWindow):
         finally:
             self._progress_end()
 
-        def _r(row):
-            value = row.get("r_factor")
-            ok = row.get("ok") and isinstance(value, (int, float)) and value == value
-            return float(value) if ok else float("inf")
+        def _rank(row):
+            def _finite(key):
+                value = row.get(key)
+                ok = row.get("ok") and isinstance(value, (int, float)) and value == value
+                return float(value) if ok else float("inf")
 
-        rows.sort(key=_r)
+            return (_finite("redchi"), _finite("r_factor"))
+
+        rows.sort(key=_rank)
         for row in rows:
             self._log(
                 f"quick check {row['label']}: R={row.get('r_factor')} "
@@ -9069,7 +9124,7 @@ class MainWindow(QMainWindow):
         if cur is None:
             return
         mode = self._struct_mode()
-        entries = self._auto_model_entries()
+        entries = self._cif_edge_checked(self._auto_model_entries(), cur)
         if mode == "single":
             if len(entries) != 1:
                 QMessageBox.information(
@@ -9114,6 +9169,7 @@ class MainWindow(QMainWindow):
             max_phases=self._max_phases(),
             user_notes=str(self.store.value("structures/auto_notes", "") or ""),
             tables_only=self.tbl_paths.rowCount() > 0,
+            on_set_s02=self._set_default_s02,
         )
         accepted = dlg.exec() == QDialog.DialogCode.Accepted
         if dlg.tables_only_chosen():
@@ -9130,12 +9186,49 @@ class MainWindow(QMainWindow):
         if applied:
             self._apply_search_result(search, cur, values)
         summary = self._search_summary(search)
+        cn_line = self._cn_summary(search.final_result) if applied else ""
+        if cn_line:
+            summary = cn_line + ("  " + summary if summary else "")
         if applied:
             summary = (summary + "  " if summary else "") + self.i18n.t("auto_applied_note")
-        dlg.show_result(self._search_rows(search), summary, applied=applied)
+        dlg.show_result(
+            self._search_rows(search), summary, applied=applied,
+            s02_fit=self._fitted_s02(search.final_result) if applied else None,
+        )
         dlg.exec()
         if applied and scope != "current":
             self._auto_fit_tables(scope)
+
+    def _cn_summary(self, result) -> str:
+        """'CN = …, R = … Å' for the first shells of a finished fit (v5.1.0)."""
+        rows = [r for r in shell_rows(result) if r["cn"] == r["cn"]] if result is not None else []
+        if not rows:
+            return ""
+        parts = []
+        for row in rows[:2]:
+            cn = f"{row['cn']:.2f}" + (
+                f" ± {row['cn_err']:.2f}" if row["cn_err"] == row["cn_err"] and row["cn_err"] > 0 else ""
+            )
+            if row["cn_fixed"]:
+                cn += " " + self.i18n.t("cn_fixed_mark")
+            parts.append(f"{row['label']}: CN {cn}, R {row['r']:.3f} Å")
+        return "; ".join(parts)
+
+    @staticmethod
+    def _fitted_s02(result):
+        """(name, value, stderr) of a fitted S0² in *result*, else None."""
+        for name, info in (getattr(result, "params", None) or {}).items():
+            if str(name).lower().startswith("s02") and str((info or {}).get("kind")) == "vary":
+                value = float((info or {}).get("value", float("nan")))
+                if value == value:
+                    return (str(name), value, float((info or {}).get("stderr", float("nan"))))
+        return None
+
+    def _set_default_s02(self, value: float) -> None:
+        """Make a fitted S0² (a standard) the default for later models (v5.1.0)."""
+        value = round(float(value), 3)
+        self.store.setValue("structures/s02", value)
+        self._log(self.i18n.t("s02_default_set", v=value))
 
     def _run_auto_model_search(self, values: dict, entries, group):
         windows = self._build_fit_settings_from_ui()
@@ -9172,6 +9265,7 @@ class MainWindow(QMainWindow):
                     bool(values.get("s02_free")),
                     bool(values.get("try_ms")),
                     windows=windows,
+                    cn_free=bool(values.get("cn_free")),
                 )
             else:
                 taken: list = []
@@ -9194,7 +9288,8 @@ class MainWindow(QMainWindow):
                         if cand["label"] == wanted:
                             pinned = cand["tag"]
                 build_fn = lambda phases: feff_build.phase_fraction_model(
-                    phases, float(values.get("s02", 0.9)), windows
+                    phases, float(values.get("s02", 0.9)), windows,
+                    cn_free=bool(values.get("cn_free")),
                 )
                 search = stepwise_phases(
                     fit_fn,

@@ -1227,9 +1227,16 @@ def starting_model(
 ) -> Tuple[List[Any], List[Any], dict]:
     """GDS + path rows for "fit the paths I picked" (N free, generic model).
 
-    Every shell gets its own N, dR and sigma^2; per-absorber s02 is fixed and e0
-    shared.  Raises ValueError("multiple-scattering") for nleg != 2 and
-    ValueError("budget") when the model cannot be supported by the data.
+    Every shell gets its own sigma^2; per-absorber s02 is fixed and e0 shared.
+    v5.1.0, within one structure run (absorber + run directory):
+      * only the nearest shell gets its own dR; further shells follow a
+        lattice expansion alpha*reff (as in the single-phase model);
+      * the first shell of each scatterer gets a free N; further shells of
+        the same scatterer keep its CN ratio, N_i = n_first * N0_i / N0_first.
+    A weak outer shell with its own N, dR and sigma^2 is not determined by the
+    data (Pt L3 demo: N2 = 3.7 +/- 5.8 with dR2 and sigma2 at their bounds).
+    Raises ValueError("multiple-scattering") for nleg != 2 and
+    ValueError("budget") when the data cannot support the model.
     """
     from .fit_engine import GDSParam, PathDef
 
@@ -1253,11 +1260,37 @@ def starting_model(
     # v4.8.0: per_dataset="{ds}" makes N and dR one parameter per dataset (a
     # joint-fit template); sigma^2 / S0^2 / e0 stay shared.
     suffix = f"_{per_dataset}" if str(per_dataset or "").strip() else ""
+    # nearest shell of each structure run owns dR; the run's alpha is added
+    # once it has a second shell (shells are sorted by absorber, then Reff)
+    lead_tag: Dict[Tuple[str, str], str] = {}
+    deltar_of: Dict[str, str] = {}
+    # first shell of each scatterer in a run owns N; later ones keep its ratio
+    n_lead: Dict[Tuple[str, str, str], Tuple[str, float]] = {}
+    amp_of: Dict[str, str] = {}
+    tied_to: Dict[str, str] = {}
     for shell, tag in zip(shells, tags):
+        key = (str(shell["absorber"]), str(shell["run_dir"]))
+        x = str(shell["absorber"])
         n0 = float(shell["n0"]) if float(shell["n0"]) == float(shell["n0"]) else 1.0
-        n_hi = max(2.0 * n0, n0 + 4.0)
-        gds.append(GDSParam(f"n_{tag}{suffix}", n0, "vary", min=0.0, max=n_hi))
-        gds.append(GDSParam(f"dr_{tag}{suffix}", 0.0, "vary", min=-0.3, max=0.3))
+        nkey = key + (str(shell["scatterer"]),)
+        if nkey not in n_lead or n_lead[nkey][1] <= 0:
+            n_hi = max(2.0 * n0, n0 + 4.0)
+            gds.append(GDSParam(f"n_{tag}{suffix}", n0, "vary", min=0.0, max=n_hi))
+            n_lead[nkey] = (tag, n0)
+            amp_of[tag] = f"s02_{x}*n_{tag}{suffix}"
+        else:
+            lead, lead_n0 = n_lead[nkey]
+            amp_of[tag] = f"s02_{x}*n_{lead}{suffix}*{n0 / lead_n0:.6g}"
+            tied_to[tag] = lead
+        if key not in lead_tag:
+            lead_tag[key] = tag
+            gds.append(GDSParam(f"dr_{tag}{suffix}", 0.0, "vary", min=-0.3, max=0.3))
+            deltar_of[tag] = f"dr_{tag}{suffix}"
+        else:
+            alpha = f"alpha_{lead_tag[key]}{suffix}"
+            if not any(g.name == alpha for g in gds):
+                gds.append(GDSParam(alpha, 0.0, "vary", min=-0.05, max=0.05))
+            deltar_of[tag] = f"{alpha}*reff"
         gds.append(GDSParam(f"ss_{tag}", 0.005, "vary", min=0.001, max=0.03))
 
     pathdefs: List[Any] = []
@@ -1268,9 +1301,9 @@ def starting_model(
                 label=f"{x}-{shell['scatterer']} {float(shell['reff']):.2f}",
                 feff_file=str(shell["feff_file"]),
                 use=True,
-                s02=f"s02_{x}*n_{tag}{suffix}",
+                s02=amp_of[tag],
                 e0=f"e0_{x}",
-                deltar=f"dr_{tag}{suffix}",
+                deltar=deltar_of[tag],
                 sigma2=f"ss_{tag}",
                 degen=1.0,
                 elem=x,
@@ -1290,6 +1323,7 @@ def starting_model(
                 "reff": float(shell["reff"]),
                 "n0": float(shell["n0"]),
                 "sources": list(shell["sources"]),
+                "n_tied_to": tied_to.get(tag, ""),
             }
             for shell, tag in zip(shells, tags)
         ],
@@ -1414,23 +1448,36 @@ def single_phase_model(
     s02_free: bool,
     windows,
     include_ms: bool = False,
+    cn_free: bool = False,
 ) -> Tuple[List[Any], List[Any], dict]:
-    """Single-phase model: N fixed at the crystallographic value (v4.9.0).
+    """Single-phase model: N = crystallographic value x site weight (v4.9.0).
 
-    degen = N0 * site weight, s02 has no N in it, the first shell gets its own
-    deltaR and every further shell uses alpha*reff (a lattice expansion).  When
-    the variable count reaches N_idp the 3rd and later shells share sigma^2;
-    if that is still too many the model is refused.
+    The first shell gets its own deltaR and every further shell uses
+    alpha*reff (a lattice expansion).  When the variable count reaches N_idp
+    the 3rd and later shells share sigma^2; if that is still too many the
+    model is refused.
+
+    Amplitude (v5.1.0) — exactly one of three choices:
+      * s02_free: S0^2 is fitted with N at the bulk value (a standard);
+      * cn_free: S0^2 stays at the given value and one CN factor cnr_<X>
+        scales every N (N_i = cnr * N0_i): the fitted coordination number of
+        a sample (nanoparticle / disorder), reported as CN = cnr * N0;
+      * neither: the whole amplitude is fixed (bulk N, given S0^2).
+    S0^2 and the CN factor multiply each other, so both free is refused.
     """
     from .fit_engine import GDSParam, PathDef
 
     paths = list(entry_paths or [])
     if not paths:
         raise ValueError("No paths given")
+    if s02_free and cn_free:
+        raise ValueError("S0^2 and the CN factor cannot both be fitted (fully correlated)")
     shells, site_note = _shells_with_weights(_window_ss(paths, windows))
     absorber = str(shells[0]["absorber"])
     x = absorber or "X"
     nidp = n_independent(windows)
+    cnr = f"cnr_{x}"
+    amp_expr = f"s02_{x}*{cnr}" if cn_free else f"s02_{x}"
     # MS rows carry the same site weight as the SS shells of their run.
     weights = {str(s["run_dir"]): float(s.get("weight", 1.0)) for s in shells}
 
@@ -1474,6 +1521,8 @@ def single_phase_model(
             GDSParam(f"e0_{x}", 0.0, "vary", min=-15.0, max=15.0),
             GDSParam(dr1, 0.0, "vary", min=-0.1, max=0.1),
         ]
+        if cn_free:
+            gds.append(GDSParam(cnr, 1.0, "vary", min=0.1, max=1.5))
         if len(shells) > 1 or ms_rows:
             gds.append(GDSParam(alpha, 0.0, "vary", min=-0.05, max=0.05))
         pathdefs: List[Any] = []
@@ -1496,7 +1545,7 @@ def single_phase_model(
                     label=f"{x}-{shell['scatterer']} {float(shell['reff']):.2f}",
                     feff_file=str(shell["feff_file"]),
                     use=True,
-                    s02=f"s02_{x}",
+                    s02=amp_expr,
                     e0=f"e0_{x}",
                     deltar=deltar,
                     sigma2=ss_name,
@@ -1512,7 +1561,7 @@ def single_phase_model(
                         label=f"{x}-{row['scatterer']} {row['reff']:.2f}",
                         feff_file=str(row["feff_file"]),
                         use=True,
-                        s02=f"s02_{x}",
+                        s02=amp_expr,
                         e0=f"e0_{x}",
                         deltar=f"{alpha}*reff",
                         sigma2=ms_ss,
@@ -1530,6 +1579,8 @@ def single_phase_model(
             raise ValueError("budget")
     report = {
         "mode": "single",
+        "cn_free": bool(cn_free),
+        "s02_free": bool(s02_free),
         "shells": [
             {
                 "tag": tag,
@@ -1563,8 +1614,13 @@ def phase_fraction_model(
     phases: Sequence[Tuple[str, Sequence["FeffPathInfo"]]],
     s02: float,
     windows,
+    cn_free: bool = False,
 ) -> Tuple[List[Any], List[Any], dict]:
     """Mixed-phase model: N fixed per phase, the phase fractions are fitted.
+
+    cn_free (v5.1.0): one CN factor cnr_<X> per absorber scales every phase's
+    N together (reduced coordination of a nanoparticle / disordered sample);
+    the fractions still sum to 1, so they keep meaning "share of absorbers".
 
     phases = [(tag, paths), ...]; the first entry is the main phase, whose
     fraction is the expression 1 - x_<p2> - ...  Each phase keeps its own
@@ -1589,6 +1645,8 @@ def phase_fraction_model(
     gds: List[Any] = [GDSParam(f"s02_{a}", float(s02), "fix") for a in absorbers]
     for a in absorbers:
         gds.append(GDSParam(f"e0_{a}", 0.0, "vary", min=-15.0, max=15.0))
+        if cn_free:
+            gds.append(GDSParam(f"cnr_{a}", 1.0, "vary", min=0.1, max=1.5))
 
     main_tag = prepared[0]["tag"]
     if len(prepared) > 1:
@@ -1621,7 +1679,11 @@ def phase_fraction_model(
                     label=f"{p['absorber']}-{shell['scatterer']} {float(shell['reff']):.2f}",
                     feff_file=str(shell["feff_file"]),
                     use=True,
-                    s02=f"s02_{p['absorber']}*x_{tag}",
+                    s02=(
+                        f"s02_{p['absorber']}*x_{tag}*cnr_{p['absorber']}"
+                        if cn_free
+                        else f"s02_{p['absorber']}*x_{tag}"
+                    ),
                     e0=f"e0_{p['absorber']}",
                     deltar=deltar,
                     sigma2=ss_name,
@@ -1635,6 +1697,7 @@ def phase_fraction_model(
         raise ValueError("budget")
     report = {
         "mode": "mixed",
+        "cn_free": bool(cn_free),
         "phases": [
             {
                 "tag": p["tag"],

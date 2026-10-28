@@ -1219,6 +1219,7 @@ class AutoModelDialog(QDialog):
         max_phases: int = 2,
         user_notes: str = "",
         tables_only: bool = False,
+        on_set_s02: Optional[Callable[[float], None]] = None,
     ):
         super().__init__(parent)
         self._t = t
@@ -1226,6 +1227,8 @@ class AutoModelDialog(QDialog):
         self.mode = mode if mode in (self.MODE_SINGLE, self.MODE_MIXED) else self.MODE_SINGLE
         self._applied = False
         self._tables_only = False
+        self._on_set_s02 = on_set_s02
+        self._s02_fit = None
         self.setWindowTitle(t("auto_dlg_title"))
         self.resize(560, 460)
         self.stack = QStackedWidget()
@@ -1247,6 +1250,19 @@ class AutoModelDialog(QDialog):
         self.chk_s02_free.setToolTip(t("auto_s02_free_tip"))
         self.chk_s02_free.setVisible(self.mode == self.MODE_SINGLE)
         form.addRow(QLabel(""), self.chk_s02_free)
+        # v5.1.0: one CN factor scales every N (sample: reduced coordination);
+        # S0² free is the standard's choice — the two are fully correlated,
+        # so ticking one unticks the other
+        self.chk_cn_free = QCheckBox(t("auto_cn_free"))
+        self.chk_cn_free.setToolTip(t("auto_cn_free_tip"))
+        self.chk_cn_free.setChecked(True)
+        form.addRow(QLabel(""), self.chk_cn_free)
+        self.chk_s02_free.toggled.connect(
+            lambda on: on and self.chk_cn_free.setChecked(False)
+        )
+        self.chk_cn_free.toggled.connect(
+            lambda on: on and self.chk_s02_free.setChecked(False)
+        )
         self.chk_try_ms = QCheckBox(t("auto_try_ms"))
         self.chk_try_ms.setToolTip(t("auto_try_ms_tip"))
         self.chk_try_ms.setVisible(self.mode == self.MODE_SINGLE and bool(has_ms))
@@ -1325,7 +1341,12 @@ class AutoModelDialog(QDialog):
         self.btn_close = QPushButton(bi("关闭", "Close"))
         self.btn_apply.clicked.connect(self._on_apply)
         self.btn_close.clicked.connect(self.reject)
+        self.btn_set_s02 = QPushButton(t("s02_set_default"))
+        self.btn_set_s02.setToolTip(t("s02_set_default_tip"))
+        self.btn_set_s02.clicked.connect(self._set_s02)
+        self.btn_set_s02.setVisible(False)
         row1.addWidget(self.btn_apply)
+        row1.addWidget(self.btn_set_s02)
         row1.addStretch(1)
         row1.addWidget(self.btn_close)
         v1.addLayout(row1)
@@ -1337,6 +1358,7 @@ class AutoModelDialog(QDialog):
             "mode": self.mode,
             "s02": float(self.sp_s02.value()),
             "s02_free": bool(self.chk_s02_free.isChecked()),
+            "cn_free": bool(self.chk_cn_free.isChecked()),
             "try_ms": bool(self.chk_try_ms.isChecked()),
             "main": str(self.cmb_main.currentData() or ""),
             "limits": bool(self.chk_limits.isChecked()),
@@ -1352,9 +1374,13 @@ class AutoModelDialog(QDialog):
         return bool(self._tables_only)
 
     # -- result page ----------------------------------------------------
-    def show_result(self, rows: Sequence[dict], summary: str, applied: bool = False) -> None:
+    def show_result(
+        self, rows: Sequence[dict], summary: str, applied: bool = False, s02_fit=None
+    ) -> None:
         """Fill the result page. ``applied``: the host already wrote the final
-        model to the tables (Auto fit), so Apply is not offered again."""
+        model to the tables (Auto fit), so Apply is not offered again.
+        ``s02_fit`` = (name, value, stderr) of a fitted S0² (a standard): the
+        page offers to make it the default for later models."""
         self.tbl_result.setRowCount(0)
         for row in rows or []:
             r = self.tbl_result.rowCount()
@@ -1388,7 +1414,23 @@ class AutoModelDialog(QDialog):
         self.lbl_summary.setText(str(summary or ""))
         self.btn_apply.setEnabled(bool(rows) and not applied)
         self.btn_apply.setVisible(not applied)
+        self._s02_fit = s02_fit
+        if s02_fit and self._on_set_s02 is not None:
+            _name, value, err = s02_fit
+            self.btn_set_s02.setText(
+                self._t("s02_set_default_n", v=f"{float(value):.3f}")
+                + (f" ± {float(err):.3f}" if err == err and err > 0 else "")
+            )
+            self.btn_set_s02.setVisible(True)
+            self.btn_set_s02.setEnabled(True)
+        else:
+            self.btn_set_s02.setVisible(False)
         self.stack.setCurrentIndex(1)
+
+    def _set_s02(self) -> None:
+        if self._s02_fit and self._on_set_s02 is not None:
+            self._on_set_s02(float(self._s02_fit[1]))
+            self.btn_set_s02.setEnabled(False)
 
     def _on_apply(self) -> None:
         self._applied = True
@@ -1418,18 +1460,20 @@ class QuickCheckDialog(QDialog):
         self._rows = list(rows or [])
         self._on_keep = on_keep
         self.setWindowTitle(t("qc_title"))
-        self.resize(620, 360)
+        self.resize(760, 360)
         root = QVBoxLayout(self)
         hint = QLabel(t("qc_hint"))
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#6b625d; font-size:11px;")
         root.addWidget(hint)
-        self.tbl = QTableWidget(0, 5)
+        self.tbl = QTableWidget(0, 7)
         self.tbl.setHorizontalHeaderLabels(
             [
                 t("qc_col_struct"),
-                t("auto_col_r"),
                 t("qc_col_redchi"),
+                t("auto_col_r"),
+                t("qc_col_nvar"),
+                t("qc_col_cn1"),
                 t("auto_col_audit"),
                 t("qc_col_note"),
             ]
@@ -1474,16 +1518,26 @@ class QuickCheckDialog(QDialog):
         note = str(row.get("error") or "")[:120] if not row.get("ok") else " ".join(row.get("flags") or [])
         if not row.get("ok") and not note:
             note = t("qc_failed")
+        cn = self._num(row.get("cn1"), "{:.1f}")
+        cn_err = row.get("cn1_err")
+        if cn != "—" and isinstance(cn_err, (int, float)) and cn_err == cn_err and cn_err > 0:
+            cn += f" ± {float(cn_err):.1f}"
+        if cn != "—" and isinstance(row.get("n0_1"), (int, float)):
+            cn += f" ({float(row['n0_1']):g})"
         values = [
             str(row.get("label", "")),
-            self._num(row.get("r_factor"), "{:.4f}"),
             self._num(row.get("redchi"), "{:.4g}"),
+            self._num(row.get("r_factor"), "{:.4f}"),
+            self._num(row.get("n_varys"), "{:.0f}"),
+            cn,
             audit,
             note,
         ]
         for c, text in enumerate(values):
             item = QTableWidgetItem(text)
-            if c == 3 and row.get("ok"):
+            if c == 4:
+                item.setToolTip(t("qc_col_cn1_tip"))
+            if c == 5 and row.get("ok"):
                 item.setForeground(
                     QBrush(
                         Qt.GlobalColor.darkRed
@@ -1493,7 +1547,7 @@ class QuickCheckDialog(QDialog):
                         else Qt.GlobalColor.darkGreen
                     )
                 )
-            if c == 4 and note:
+            if c == 6 and note:
                 item.setToolTip(note)
             self.tbl.setItem(r, c, item)
 

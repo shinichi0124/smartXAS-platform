@@ -1848,16 +1848,22 @@ STRINGS = {
     # ---- v4.11.0 quick check (replaces Quick fit) ----
     "cif_quick_check": {"zh": "快速筛查", "en": "Quick check"},
     "cif_quick_check_tip": {
-        "zh": "每个勾选结构单独做一次最简单相拟合（N 固定为晶体学值、S0² 固定、只用单散射），按 R 因子排序，看哪个结构最像数据；不改表格",
-        "en": "One minimal single-phase fit per ticked structure (N fixed at crystallographic values, S0² fixed, single scattering only), ranked by R-factor to see which structure looks like the data; the tables are not touched",
+        "zh": "每个勾选结构单独做一次最简单相拟合（只用单散射，S0² 用默认值，一个共用 CN 因子），按约化 χ² 排序，看哪个结构最像数据；不改表格",
+        "en": "One minimal single-phase fit per ticked structure (single scattering, S0² at its default, one shared CN factor), ranked by reduced χ² to see which structure looks like the data; the tables are not touched",
     },
     "qc_title": {"zh": "CIF 快速筛查", "en": "CIF quick check"},
     "qc_hint": {
-        "zh": "每个结构单独做最简单相拟合（N 固定、S0² 固定、只用单散射），R 因子小的排前面。这只是筛查，表格没变；选定后点「只勾这个」，再点上方「自动拟合」得到正式结果",
-        "en": "Each structure gets a minimal single-phase fit (N fixed, S0² fixed, single scattering only); lowest R-factor first. This is a screen only and the tables are unchanged; pick one, click Tick only this one, then Auto fit at the top for the real result",
+        "zh": "每个结构单独做最简单相拟合（只用单散射，S0² 用默认值，一个共用 CN 因子），按约化 χ² 排序（多壳层的结构要为多出的变量付代价）。这只是筛查，表格没变；选定后点「只勾这个」，再点「自动拟合」得到正式结果",
+        "en": "Each structure gets a minimal single-phase fit (single scattering, S0² at its default, one shared CN factor), ranked by reduced χ² (structures with more shells pay for their extra variables). This is a screen only and the tables are unchanged; pick one, click Tick only this one, then Auto fit for the real result",
     },
     "qc_col_struct": {"zh": "结构", "en": "Structure"},
     "qc_col_redchi": {"zh": "约化 χ²", "en": "Reduced χ²"},
+    "qc_col_nvar": {"zh": "变量数", "en": "Variables"},
+    "qc_col_cn1": {"zh": "CN₁（体相）", "en": "CN₁ (bulk)"},
+    "qc_col_cn1_tip": {
+        "zh": "第一壳层配位数 = 共用 CN 因子 × 晶体学 N（括号内为体相值）；S0² 用默认值",
+        "en": "First-shell coordination = shared CN factor × crystallographic N (bulk value in brackets); S0² at its default",
+    },
     "qc_col_note": {"zh": "说明", "en": "Note"},
     "qc_keep": {"zh": "只勾这个", "en": "Tick only this one"},
     "qc_keep_tip": {
@@ -1871,7 +1877,24 @@ STRINGS = {
     },
     "auto_start": {"zh": "开始", "en": "Start"},
     "auto_apply": {"zh": "应用到表格", "en": "Apply to tables"},
-    "auto_s02_free": {"zh": "S0² 一起拟合", "en": "Fit S0²"},
+    "auto_s02_free": {"zh": "S0² 一起拟合（标样）", "en": "Fit S0² (standard)"},
+    "auto_cn_free": {"zh": "配位数一起拟合（样品）", "en": "Fit CN (sample)"},
+    "auto_cn_free_tip": {
+        "zh": "一个共用 CN 因子乘到每个壳层的晶体学 N 上（纳米颗粒、无序样品配位数降低），S0² 用上面的值（先在标样上定）。结果直接给出配位数 CN = 因子 × N₀。和「S0² 一起拟合」二选一：两者相乘，不能同时拟合；都不勾 = 振幅完全固定（体相 N、给定 S0²）",
+        "en": "One shared CN factor multiplies every shell's crystallographic N (reduced coordination of nanoparticles / disordered samples); S0² stays at the value above (determine it on a standard first). The result gives CN = factor × N₀. Either this or Fit S0²: they multiply each other and cannot both be fitted; neither = the amplitude is fixed (bulk N, given S0²)",
+    },
+    "cn_fixed_mark": {"zh": "（固定）", "en": "(fixed)"},
+    "s02_set_default": {"zh": "设为默认 S0²", "en": "Use as default S0²"},
+    "s02_set_default_n": {"zh": "设为默认 S0² = {v}", "en": "Use S0² = {v} as default"},
+    "s02_set_default_tip": {
+        "zh": "把这次在标样上拟合出的 S0² 存为默认值，以后的自动拟合、快速筛查、初始模型都用它",
+        "en": "Store the S0² fitted on this standard as the default for later Auto fit, Quick check and starting models",
+    },
+    "s02_default_set": {"zh": "默认 S0² 已设为 {v}", "en": "Default S0² set to {v}"},
+    "edge_mismatch_ask": {
+        "zh": "{n} 个结构的吸收边和当前数据（{edge}）不同：{names}。\nFEFF 路径带着吸收边的芯空穴，用错吸收边相移就是错的。\n\n是：把它们改成 {edge} 并重新运行 FEFF\n否：这次跳过这些结构",
+        "en": "{n} structure(s) are set to a different edge than the current data ({edge}): {names}.\nFEFF paths carry the edge's core hole, so the wrong edge gives wrong phase shifts.\n\nYes: set them to {edge} and run FEFF again\nNo: leave them out this time",
+    },
     "auto_s02_free_tip": {
         "zh": "用标样（箔或已知结构）定 S0² 时勾选；样品通常用固定值",
         "en": "Tick when calibrating S0² on a standard (foil or known structure); keep it fixed for samples",
