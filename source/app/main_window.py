@@ -130,19 +130,38 @@ from .athena_ops import (
 )
 from .fit_engine import (
     DEFAULT_OUTPUT,
+    FitDataset,
     FitResult,
     FitSettings,
     GDSParam,
     PathDef,
     clear_fit_history,
+    compare_snapshots,
+    dataset_tag,
+    expand_gds,
+    hamilton_test,
     list_fit_history,
     load_fit_snapshot,
     model_a_preset,
     prepare_model_a_paths,
     project_paths,
     run_feffit,
+    run_feffit_multi,
     save_fit_to_history,
 )
+from . import feff_build
+from .feff_dialog import (
+    AmcsdSearchDialog,
+    AutoModelDialog,
+    QuickCheckDialog,
+    CifSearchDialog,
+    CopyToGroupsDialog,
+    PathPickDialog,
+    StructureSettingsDialog,
+)
+from . import ccdc_bridge
+from .fit_audit import AuditFlag, audit_fit, format_flags, verdict as audit_verdict
+from .fit_search import single_phase_search, stepwise_phases
 from . import coding_registry as AGENTREG
 from . import pipeline_rules
 from . import plugins_manager
@@ -1941,6 +1960,7 @@ def _action_scope_row(
     rad_all: "QRadioButton",
     undo_btn: "Optional[QPushButton]" = None,
     extra: "Optional[QWidget]" = None,
+    tight: bool = False,
 ) -> QWidget:
     """
     One row:  [Action]  ○ Current  ○ Marked  ○ All  [↶]  spread evenly
@@ -1952,7 +1972,10 @@ def _action_scope_row(
     host = QWidget()
     h = QHBoxLayout(host)
     h.setContentsMargins(0, 2, 0, 2)
-    h.setSpacing(4)
+    h.setSpacing(2 if tight else 4)
+    if tight:  # v4.11.0 Auto fit row: a wide extra field must still fit
+        for r in (rad_current, rad_marked, rad_all):
+            r.setStyleSheet("QRadioButton { spacing: 2px; }")
     run_btn.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
     run_btn.setMinimumWidth(ACTION_BTN_MIN_W)
     h.addWidget(run_btn, 0)
@@ -2162,6 +2185,12 @@ class MainWindow(QMainWindow):
         # Per-module undo: last action's group snapshots (+ optional added groups / fit UI)
         self._module_undo: dict = {}
         self._undo_buttons: dict = {}  # module key → QPushButton
+        # v4.7.0 structure library + model comparison state (session only)
+        self._cif_entries: list = []
+        self._cif_library_path: Optional[Path] = None
+        self._cif_running = False
+        self._model_comparisons: list = []
+        self._last_search = None  # v4.9.0: the phase search behind the shown fit
         # module key → {current, marked, all: QRadioButton}
         self._scope_radios: dict = {}
         self._action_btns: list = []  # short action buttons sharing one width (v3.19.6)
@@ -2973,11 +3002,31 @@ class MainWindow(QMainWindow):
         scroll, page, ff = self._scroll_page()
         self.fit_scroll = scroll
         # Spacing already tight from _scroll_page (no right scrollbar rail).
-        self.lbl_fit_mode = QLabel()
-        self.lbl_fit_mode.setWordWrap(True)
-        self.lbl_fit_mode.setStyleSheet("font-weight:600;")
-        ff.addWidget(self.lbl_fit_mode)
-        # (no per-group data label — group selection is visible in the left list)
+        # (no page title line since v4.11.0: the how-to is the small hint at
+        # the structure list's top-left; no per-group data label either)
+
+        # ---- Fit windows & view (top of the page, v4.11.0) ----
+        # Read-only summary of the k/R windows the fit uses (edited in Norm → FT)
+        # in two columns, then the display controls in the same box.
+        self.box_fit_win = CollapsibleGroupBox()
+        fw = self.box_fit_win.body_layout()
+        win_grid = QGridLayout()
+        win_grid.setContentsMargins(0, 0, 0, 0)
+        win_grid.setHorizontalSpacing(10)
+        win_grid.setVerticalSpacing(2)
+        self.lbl_fit_win_k = QLabel()
+        self.lbl_fit_win_r = QLabel()
+        self.lbl_fit_kweights = QLabel()
+        self.lbl_fit_from_ft = QLabel()
+        for _lab in (self.lbl_fit_kweights, self.lbl_fit_from_ft):
+            _lab.setStyleSheet("color:#6b625d;")
+        win_grid.addWidget(self.lbl_fit_win_k, 0, 0)
+        win_grid.addWidget(self.lbl_fit_kweights, 0, 1)
+        win_grid.addWidget(self.lbl_fit_win_r, 1, 0)
+        win_grid.addWidget(self.lbl_fit_from_ft, 1, 1)
+        win_grid.setColumnStretch(0, 1)
+        fw.addLayout(win_grid)
+        ff.addWidget(self.box_fit_win)
 
         # ---- Auto fit + AI Assist (first collapsible session, same style as Norm modules) ----
         self.box_auto_fit = CollapsibleGroupBox()
@@ -2990,27 +3039,24 @@ class MainWindow(QMainWindow):
         self.btn_auto_fit_reinit = self._register_undo_btn(
             "auto_fit", on_click=self._auto_fit_reinit
         )
+        # fitting mode + phase cap as ONE dropdown on the Auto fit row
+        # (v4.11.0): Single / Mixed ≤2 / ≤3 / ≤4. Auto fit carries it out
+        # when structures are ticked; the AutoModel search reads it.
+        self.cmb_struct_mode = QComboBox()
+        for _mode, _n in self.STRUCT_MODES:
+            self.cmb_struct_mode.addItem("", f"{_mode}:{_n}")
+        self.cmb_struct_mode.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self._retranslate_struct_mode()
+        self.cmb_struct_mode.currentIndexChanged.connect(self._struct_mode_changed)
         row_af, _ = self._make_scope_action_row(
-            "auto_fit", self.btn_auto_fit, self.btn_auto_fit_reinit
+            "auto_fit", self.btn_auto_fit, self.btn_auto_fit_reinit,
+            extra=self.cmb_struct_mode, tight=True,
         )
         af.addWidget(row_af)
 
         # The Fit-page AI Assist block moved to the top ai_check bar (v3.19.5):
         # one entry point above the page tabs, user-chosen categories.
-        ff.addWidget(self.box_auto_fit)
-
-        # Read-only fit summary: the editable k/R windows remain in Norm → FT.
-        self.box_fit_win = CollapsibleGroupBox()
-        fw = self.box_fit_win.body_layout()
-        self.lbl_fit_kweights = QLabel()
-        self.lbl_fit_kweights.setStyleSheet("color:#6b625d; font-size:11px;")
-        self.lbl_fit_win = QLabel()
-        self.lbl_fit_win.setWordWrap(True)
-        fw.addWidget(self.lbl_fit_kweights)
-        fw.addWidget(self.lbl_fit_win)
-        ff.addWidget(self.box_fit_win)
-
-        # Display controls sit immediately above the fit setup tables.
+        # Display controls: second part of the Fit windows & view box.
         self.cmb_fit_plot = QComboBox()
         for label, code in (
             ("E / k / R / q", "standard"),
@@ -3033,8 +3079,114 @@ class MainWindow(QMainWindow):
         self.cmb_fit_plot.currentIndexChanged.connect(self._fit_plot_changed)
         self.cmb_fit_plot_kw.currentIndexChanged.connect(self._fit_plot_weight_changed)
         self.fit_plot_host = _row(self.lbl_fit_plot, self.cmb_fit_plot, self.lbl_fit_plot_kw, self.cmb_fit_plot_kw)
-        ff.addWidget(self.fit_plot_host)
+        fw.addWidget(self.fit_plot_host)
+        # (box_auto_fit is added after the Structures module: v4.11.0 order is
+        # windows → structures (tick, Quick check) → Auto fit → paths → GDS)
         self._fit_layout = ff
+
+        # ---- Structures (CIF): structure library -> FEFF paths (v4.7.0) ----
+        # Page order is structure -> FEFF paths -> GDS: what you start from,
+        # what FEFF made of it, then the fit parameters.
+        self.box_cif = CollapsibleGroupBox(expanded=True)
+        self.box_cif.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum
+        )
+        bc = self.box_cif.body_layout()
+        # v4.11.0: two rows above the list, natural width, left-aligned:
+        # row 1 = fitting mode / max phases / Auto model, then CIF files / CIF
+        # search; row 2 = Run FEFF / Pick paths / Quick fit with A/U/I pinned
+        # to the right (the list's top-right corner). AMCSD is a source inside
+        # CIF search and the library folder lives in Settings → Databases.
+        def _left_row(*widgets, tail=None, spacing=3) -> QWidget:
+            host = QWidget()
+            row = QHBoxLayout(host)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(spacing)
+            for w in widgets:
+                row.addWidget(w)
+            row.addStretch(1)
+            for w in tail or ():
+                row.addWidget(w)
+            return host
+
+        self.btn_cif_files = QPushButton()
+        self.btn_cif_files.setObjectName("ghostBtn")
+        self.btn_cif_files.clicked.connect(self._cif_add_files)
+        self.btn_cif_ccdc = QPushButton()
+        self.btn_cif_ccdc.setObjectName("ghostBtn")
+        self.btn_cif_ccdc.clicked.connect(self._open_ccdc)
+        self._cif_mark_btns = []  # (button, tooltip key) — retranslated
+        mark_btns = []
+        for _txt, _tip_key, _mode in (
+            ("A", "mark_all_detail", "all"),
+            ("U", "mark_none_detail", "none"),
+            ("I", "mark_invert_detail", "invert"),
+        ):
+            _mb = QToolButton()
+            _mb.setText(_txt)
+            _mb.setFixedSize(22, 22)
+            _mb.setToolTip(self.i18n.t(_tip_key))
+            _mb.clicked.connect(lambda *_a, m=_mode: self._cif_bulk_mark(m))
+            mark_btns.append(_mb)
+            self._cif_mark_btns.append((_mb, _tip_key))
+
+        self.btn_cif_run = QPushButton()
+        self.btn_cif_run.setObjectName("ghostBtn")
+        self.btn_cif_run.clicked.connect(self._cif_run_feff)
+        self.btn_cif_paths = QPushButton()
+        self.btn_cif_paths.setObjectName("ghostBtn")
+        self.btn_cif_paths.clicked.connect(self._cif_pick_paths)
+        self.btn_cif_quick = QPushButton()
+        self.btn_cif_quick.setObjectName("ghostBtn")
+        self.btn_cif_quick.clicked.connect(lambda *_: self._cif_quick_check())
+
+        # tighter side padding so the five buttons share one row
+        for _b in (
+            self.btn_cif_quick, self.btn_cif_files, self.btn_cif_ccdc,
+            self.btn_cif_run, self.btn_cif_paths,
+        ):
+            _b.setStyleSheet("padding: 4px 5px;")
+        # above the list: a small how-to on the left, A/U/I at its top-right
+        # corner; the buttons (structure chain + Quick check) go below it
+        self.lbl_cif_hint = QLabel()
+        self.lbl_cif_hint.setStyleSheet("color:#6b625d; font-size:11px;")
+        # never widens the column: a long translation is cut, the tooltip has it all
+        self.lbl_cif_hint.setMinimumWidth(1)
+        bc.addWidget(_left_row(self.lbl_cif_hint, tail=mark_btns))
+
+        self.tbl_structs = QTableWidget(0, 4)
+        self.tbl_structs.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        for _col in (1, 2, 3):
+            self.tbl_structs.horizontalHeader().setSectionResizeMode(
+                _col, QHeaderView.ResizeMode.ResizeToContents
+            )
+        # Narrow panel: no horizontal scrollbar, elide instead.
+        self.tbl_structs.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.tbl_structs.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.tbl_structs.verticalHeader().setVisible(False)
+        self.tbl_structs.setMinimumHeight(120)
+        self.tbl_structs.setMaximumHeight(120)
+        self.tbl_structs.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl_structs.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.tbl_structs.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tbl_structs.customContextMenuRequested.connect(self._cif_context_menu)
+        self.tbl_structs.cellClicked.connect(self._cif_cell_clicked)
+        self.tbl_structs.cellDoubleClicked.connect(self._cif_cell_double_clicked)
+        bc.addWidget(self.tbl_structs)
+        bc.addWidget(
+            _left_row(
+                self.btn_cif_files,
+                self.btn_cif_ccdc,
+                self.btn_cif_run,
+                self.btn_cif_paths,
+                self.btn_cif_quick,
+                spacing=2,
+            )
+        )
+        ff.addWidget(self.box_cif)
+        ff.addWidget(self.box_auto_fit)  # runs on what is ticked just above
 
         # ---- GDS parameter table (same working height as FEFF Paths) ----
         self.box_gds = CollapsibleGroupBox(expanded=True)
@@ -3071,7 +3223,7 @@ class MainWindow(QMainWindow):
                 self.btn_gds_clear,
             )
         )
-        ff.addWidget(self.box_gds)
+        # (added below the FEFF path table — v4.7.0 page order: CIF -> paths -> GDS)
 
         # ---- feff path table ----
         self.box_fit_paths = CollapsibleGroupBox(expanded=True)
@@ -3079,7 +3231,7 @@ class MainWindow(QMainWindow):
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum
         )
         fp = self.box_fit_paths.body_layout()
-        self.tbl_paths = QTableWidget(0, 9)
+        self.tbl_paths = QTableWidget(0, 10)
         self.tbl_paths.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         # The element selector must retain enough in-cell margin for its frame
         # and arrow; ResizeToContents can otherwise shrink the editable widget
@@ -3093,6 +3245,8 @@ class MainWindow(QMainWindow):
         self.tbl_paths.setMaximumHeight(160)
         self.tbl_paths.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.tbl_paths.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl_paths.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tbl_paths.customContextMenuRequested.connect(self._paths_context_menu)
         fp.addWidget(self.tbl_paths)
         self.btn_model_a_paths = QPushButton()
         self.btn_model_a_paths.setObjectName("ghostBtn")
@@ -3114,6 +3268,39 @@ class MainWindow(QMainWindow):
         )
         fp.addWidget(self.path_actions_host)
         ff.addWidget(self.box_fit_paths)
+        ff.addWidget(self.box_gds)
+
+        # ---- Joint fit (v4.8.0): one model, several datasets ----
+        self.box_joint_fit = CollapsibleGroupBox(expanded=False)
+        self.box_joint_fit.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum
+        )
+        bj = self.box_joint_fit.body_layout()
+        self.lbl_joint_hint = QLabel()
+        self.lbl_joint_hint.setWordWrap(True)
+        self.lbl_joint_hint.setStyleSheet("color:#6b625d; font-size:11px;")
+        bj.addWidget(self.lbl_joint_hint)
+        self.tbl_joint = QTableWidget(0, 4)
+        self.tbl_joint.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        for _jc in (1, 2, 3):
+            self.tbl_joint.horizontalHeader().setSectionResizeMode(
+                _jc, QHeaderView.ResizeMode.ResizeToContents
+            )
+        self.tbl_joint.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.tbl_joint.verticalHeader().setVisible(False)
+        self.tbl_joint.setMinimumHeight(110)
+        self.tbl_joint.setMaximumHeight(110)
+        self.tbl_joint.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl_joint.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.tbl_joint.cellClicked.connect(self._joint_row_clicked)
+        bj.addWidget(self.tbl_joint)
+        self.btn_joint_fit = QPushButton()
+        self.btn_joint_fit.setObjectName("ghostBtn")
+        self.btn_joint_fit.clicked.connect(lambda *_: self._run_joint_fit())
+        bj.addWidget(self.btn_joint_fit)
+        ff.addWidget(self.box_joint_fit)
 
         # ---- Run Fit → quality → history → demo+export row ----
         self.btn_fit = QPushButton()
@@ -3133,9 +3320,14 @@ class MainWindow(QMainWindow):
         self.lbl_fit_warning = QLabel()
         self.lbl_fit_warning.setWordWrap(True)
         self.lbl_fit_warning.setStyleSheet("font-size:11px; color:#8a5a00;")
+        # v4.9.0: the parameter audit line (diagnostic, never a proof)
+        self.lbl_fit_audit = QLabel()
+        self.lbl_fit_audit.setWordWrap(True)
+        self.lbl_fit_audit.setStyleSheet("font-size:11px; color:#4b4742;")
         quality_v.addWidget(self.lbl_fit_grade)
         quality_v.addWidget(self.lbl_fit_quality)
         quality_v.addWidget(self.lbl_fit_warning)
+        quality_v.addWidget(self.lbl_fit_audit)
         ff.addWidget(self.fit_quality_card)
 
         # History: select previews; Restore refills GDS/paths/windows
@@ -3164,14 +3356,13 @@ class MainWindow(QMainWindow):
         self.btn_hist_restore.clicked.connect(self._restore_fit_history)
         self.btn_hist_restore.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.btn_hist_restore.setMinimumHeight(26)
-        hist_btns = QHBoxLayout()
-        hist_btns.setContentsMargins(0, 0, 0, 0)
-        hist_btns.setSpacing(6)
-        hist_btns.addWidget(self.btn_hist_restore, 1)
-        hist_v.addLayout(hist_btns)
+        self.btn_hist_compare = QPushButton()
+        self.btn_hist_compare.setObjectName("ghostBtn")
+        self.btn_hist_compare.clicked.connect(self._compare_fits_dialog)
+        self.btn_hist_compare.setMinimumHeight(26)
         ff.addWidget(hist_host)
 
-        # Bottom row: [📂 folder] [demo check] [Export report + data]
+        # Bottom (v4.11.0): [Compare] [Restore] [demo check] / [Export] [📂]
         self.btn_demo_folder = QPushButton()
         self.btn_demo_folder.setObjectName("ghostBtn")
         self.btn_demo_folder.setFixedWidth(32)
@@ -3188,15 +3379,33 @@ class MainWindow(QMainWindow):
         self.btn_fit_export_data = self.btn_fit_export_all
         self.btn_ai_review = QPushButton()  # retained for retranslate safety; not shown
         self.btn_ai_review.setVisible(False)
+        self.btn_validate_ui.setMinimumHeight(26)
+        hist_btns = QHBoxLayout()
+        hist_btns.setContentsMargins(0, 0, 0, 0)
+        hist_btns.setSpacing(6)
+        hist_btns.addWidget(self.btn_hist_compare, 1)
+        hist_btns.addWidget(self.btn_hist_restore, 1)
+        hist_btns.addWidget(self.btn_validate_ui, 1)
+        hist_v.addLayout(hist_btns)
         demo_export_row = QHBoxLayout()
         demo_export_row.setContentsMargins(0, 0, 0, 0)
         demo_export_row.setSpacing(6)
-        demo_export_row.addWidget(self.btn_demo_folder)
-        demo_export_row.addWidget(self.btn_validate_ui, 1)
         demo_export_row.addWidget(self.btn_fit_export_all, 1)
+        demo_export_row.addWidget(self.btn_demo_folder)
         ff.addLayout(demo_export_row)
 
         self.left_stack.addWidget(scroll)  # index 1
+
+        # Structure library from QSettings (fail-soft: a bad file must not stop
+        # the window from opening — load_structures renames a corrupt JSON).
+        try:
+            self._cif_reload()
+        except Exception as exc:  # pragma: no cover - defensive
+            self._log(f"structures load failed: {exc}")
+        try:
+            self._restore_struct_mode()
+        except Exception as exc:  # pragma: no cover - defensive
+            self._log(f"fit mode restore failed: {exc}")
 
     def _build_energy_page(self):
         """Tools page: grouped sub-panels with method selectors + Apply."""
@@ -3837,8 +4046,10 @@ class MainWindow(QMainWindow):
         self.chk_auto.setText(t("auto_reprocess"))
         self.chk_auto.setToolTip(t("auto_reprocess_tip"))
         # fit page
-        self.lbl_fit_mode.setText(t("fit_mode"))
         self.lbl_fit_kweights.setText(t("fit_kweights_fixed"))
+        self.lbl_fit_from_ft.setText(t("fit_win_from_ft"))
+        for _lab in (self.lbl_fit_win_k, self.lbl_fit_win_r, self.lbl_fit_kweights, self.lbl_fit_from_ft):
+            _lab.setToolTip(t("fit_win_from_ft_tip"))
         self.lbl_fit_plot.setText(t("fit_plot"))
         self.lbl_fit_plot_kw.setText(t("fit_plot_kw"))
         if hasattr(self, "box_auto_fit"):
@@ -3853,10 +4064,34 @@ class MainWindow(QMainWindow):
         self.btn_gds_add.setText(t("btn_gds_add"))
         self.btn_gds_del.setText(t("btn_del_sel"))
         self.btn_gds_clear.setText(t("btn_gds_clear"))
+        if hasattr(self, "box_joint_fit"):
+            self.box_joint_fit.setTitle(t("box_joint_fit"))
+            self.tbl_joint.setHorizontalHeaderLabels(
+                [
+                    t("joint_col_tag"),
+                    t("joint_col_k"),
+                    t("joint_col_r"),
+                    t("joint_col_rf"),
+                ]
+            )
+            self.btn_joint_fit.setText(t("btn_joint_fit"))
+            self.btn_joint_fit.setToolTip(t("joint_fit_hint", n=len(self._joint_fit_set())))
         self.box_fit_paths.setTitle(t("box_paths"))
         self.tbl_paths.setHorizontalHeaderLabels(
-            [t("path_col_use"), t("path_col_elem"), t("path_col_label"), t("path_col_file"), "s02", "e0", "ΔR", "σ²", t("path_col_degen")]
+            [
+                t("path_col_use"),
+                t("path_col_elem"),
+                t("path_col_data"),
+                t("path_col_label"),
+                t("path_col_file"),
+                "s02",
+                "e0",
+                "ΔR",
+                "σ²",
+                t("path_col_degen"),
+            ]
         )
+        self._refresh_path_data_combos()
         self.btn_model_a_paths.setText(t("btn_model_a_paths_short"))
         self.btn_model_a_paths.setToolTip(t("btn_model_a_paths_tip"))
         self.btn_feff_ui.setText("FEFF")
@@ -3871,6 +4106,38 @@ class MainWindow(QMainWindow):
         self.btn_hist_restore.setToolTip(t("btn_hist_restore_tip"))
         self.btn_hist_clear.setText(t("btn_hist_clear"))
         self.btn_hist_clear.setToolTip(t("btn_hist_clear_tip"))
+        if hasattr(self, "btn_hist_compare"):
+            self.btn_hist_compare.setText(t("btn_hist_compare"))
+            self.btn_hist_compare.setToolTip(t("btn_hist_compare_tip"))
+        if hasattr(self, "cmb_struct_mode"):
+            self._retranslate_struct_mode()
+        if hasattr(self, "box_cif"):
+            self.box_cif.setTitle(t("box_cif"))
+            self.tbl_structs.setHorizontalHeaderLabels(
+                [
+                    t("cif_col_struct"),
+                    t("cif_col_abs"),
+                    t("cif_col_site"),
+                    t("cif_col_status"),
+                ]
+            )
+            self.lbl_cif_hint.setText(t("cif_list_hint"))
+            self.lbl_cif_hint.setToolTip(t("cif_list_hint_tip"))
+            self.btn_cif_files.setText(t("cif_files_btn"))
+            self.btn_cif_files.setToolTip(t("cif_add_files_tip"))
+            self.btn_cif_ccdc.setText(t("cif_ccdc"))
+            self.btn_cif_ccdc.setToolTip(t("cif_ccdc_tip"))
+            for _mb, _tip_key in getattr(self, "_cif_mark_btns", []):
+                _mb.setToolTip(t(_tip_key))
+            self.btn_cif_run.setText(t("cif_run"))
+            self.btn_cif_run.setToolTip(t("cif_run_tip"))
+            self.btn_cif_paths.setText(t("cif_pick_paths"))
+            self.btn_cif_paths.setToolTip(t("cif_pick_paths_tip"))
+            self.btn_cif_quick.setText(t("cif_quick_check"))
+            self.btn_cif_quick.setToolTip(t("cif_quick_check_tip"))
+            self._refresh_ccdc_button()
+            if getattr(self, "_cif_entries", None):
+                self._cif_refresh_table()
         self.btn_fit.setText(t("run_fit"))
         self.btn_validate_ui.setText(t("run_validate"))
         self.btn_validate_ui.setToolTip(t("run_validate_tip"))
@@ -3879,6 +4146,9 @@ class MainWindow(QMainWindow):
         self.lbl_fit_grade.setText(t("fit_quality_ph"))
         self.lbl_fit_quality.setText("")
         self.lbl_fit_warning.setText("")
+        if hasattr(self, "lbl_fit_audit"):
+            self.lbl_fit_audit.setText("")
+            self.lbl_fit_audit.setToolTip("")
         if hasattr(self, "btn_fit_export_all"):
             self.btn_fit_export_all.setText(t("fit_export_all"))
             self.btn_fit_export_all.setToolTip(t("fit_export_all_tip"))
@@ -4028,15 +4298,16 @@ class MainWindow(QMainWindow):
         self._status(f"Panel: {mode}", 4000)
 
     def _refresh_fit_panel(self):
-        if hasattr(self, "lbl_fit_win"):
+        if hasattr(self, "lbl_fit_win_k"):
             try:
                 s = self._settings_from_controls()
-                self.lbl_fit_win.setText(
-                    f"k = {s.kmin:.2f} – {s.kmax:.2f}; dk = {s.dk:.2f}; {s.kwindow}\n"
-                    f"R = {s.rmin:.2f} – {s.rmax:.2f}; dR = {s.dr:.2f}; {s.rwindow}"
-                )
+                self.lbl_fit_win_k.setText(f"k {s.kmin:.2f} – {s.kmax:.2f} · dk {s.dk:.2f} · {s.kwindow}")
+                self.lbl_fit_win_r.setText(f"R {s.rmin:.2f} – {s.rmax:.2f} · dR {s.dr:.2f} · {s.rwindow}")
             except Exception:
                 pass
+        self._refresh_joint_table()
+        self._refresh_path_data_combos()  # the marked set feeds the Data drop-downs
+        self._refresh_ccdc_button()
         self._refresh_fit_history()
 
     # ========== Fit page: GDS / path tables + history ==========
@@ -4055,8 +4326,12 @@ class MainWindow(QMainWindow):
             curve_state = self.i18n.t(
                 "history_curves_saved" if row.get("has_curves") else "history_report_only"
             )
+            prefix = ""
+            if row.get("joint"):
+                prefix = f"joint({int(row.get('n_datasets') or 0)})  "
             self.cmb_fit_history.addItem(
-                f"{row.get('stamp', '')}  {rf_s}  [{curve_state}]  {row.get('data', '')}", row.get("file")
+                f"{prefix}{row.get('stamp', '')}  {rf_s}  [{curve_state}]  {row.get('data', '')}",
+                row.get("file"),
             )
         if cur_file:
             idx = self.cmb_fit_history.findData(cur_file)
@@ -4092,19 +4367,30 @@ class MainWindow(QMainWindow):
         for d in snap.get("paths", []):
             self._paths_add_row(PathDef.from_dict(d))
         st = snap.get("settings", {}) or {}
-        self._block = True
-        try:
-            for attr, spin in (
-                ("kmin", self.sp_kmin), ("kmax", self.sp_kmax), ("dk", self.sp_dk),
-                ("rmin", self.sp_rmin), ("rmax", self.sp_rmax), ("dr", self.sp_dr),
-                ("rbkg", self.sp_rbkg),
-            ):
-                if attr in st and st[attr] is not None:
-                    spin.setValue(float(st[attr]))
-            self._set_win_combo(self.cmb_kwin, st.get("kwindow"))
-            self._set_win_combo(self.cmb_rwin, st.get("rwindow"))
-        finally:
-            self._block = False
+        if snap.get("joint"):
+            # A joint snapshot describes several datasets with their own
+            # windows: restore the tables only and say so (v4.8.0).
+            names = ", ".join(str(d.get("name", "")) for d in (snap.get("datasets") or []))
+            self._log(
+                self._bi(
+                    f"联合快照（{names}）：只回填 GDS 与路径表，各组窗口不变",
+                    f"Joint snapshot ({names}): GDS and paths restored; per-dataset windows left alone",
+                )
+            )
+        else:
+            self._block = True
+            try:
+                for attr, spin in (
+                    ("kmin", self.sp_kmin), ("kmax", self.sp_kmax), ("dk", self.sp_dk),
+                    ("rmin", self.sp_rmin), ("rmax", self.sp_rmax), ("dr", self.sp_dr),
+                    ("rbkg", self.sp_rbkg),
+                ):
+                    if attr in st and st[attr] is not None:
+                        spin.setValue(float(st[attr]))
+                self._set_win_combo(self.cmb_kwin, st.get("kwindow"))
+                self._set_win_combo(self.cmb_rwin, st.get("rwindow"))
+            finally:
+                self._block = False
         self._log(self._bi(f"已恢复历史拟合: {snap.get('stamp', '')}", f"Restored fit snapshot: {snap.get('stamp', '')}"))
         self._preview_history_snapshot()
         self._refresh_fit_panel()
@@ -4155,6 +4441,8 @@ class MainWindow(QMainWindow):
                     correlations=[tuple(c) for c in (snap.get("correlations") or [])],
                     report_text=str(snap.get("report_text") or ""),
                     plot_views=views,
+                    audit=list(snap.get("audit") or []),
+                    fit_mode=str(snap.get("fit_mode") or ""),
                 )
                 self.last_fit = historic
                 self._update_fit_quality(historic)
@@ -4252,6 +4540,46 @@ class MainWindow(QMainWindow):
                     return sym
         return ""
 
+    def _path_data_combo_groups(self) -> List[str]:
+        """Dataset choices for the Data column: the current fit set (marked)."""
+        return [str(g.name) for g in self._marked_groups_for_scope()]
+
+    def _fill_path_data_combo(self, box: QComboBox, current: str) -> None:
+        current = str(current or "").strip()
+        box.blockSignals(True)
+        box.clear()
+        box.addItem(self.i18n.t("path_data_all"), "")
+        for name in self._path_data_combo_groups():
+            box.addItem(name, name)
+        idx = box.findData(current)
+        if idx < 0 and current:
+            # Keep a saved assignment even when that group is not marked now.
+            box.addItem(current + " ?", current)
+            idx = box.count() - 1
+        box.setCurrentIndex(idx if idx >= 0 else 0)
+        box.setToolTip(self.i18n.t("path_col_data_tip"))
+        box.blockSignals(False)
+
+    def _path_data_combo(self, current: str, row: int) -> QComboBox:
+        """Path table Data column (which dataset this path feeds)."""
+        box = QComboBox()
+        box.setObjectName("pathDataCombo")
+        box.setEditable(False)
+        box.setFixedWidth(84)
+        self._fill_path_data_combo(box, current)
+        return box
+
+    def _refresh_path_data_combos(self) -> None:
+        """Re-fill every Data combo (group set / language changed)."""
+        if not hasattr(self, "tbl_paths"):
+            return
+        for row in range(self.tbl_paths.rowCount()):
+            box = self.tbl_paths.cellWidget(row, 2)
+            if not isinstance(box, QComboBox):
+                continue
+            current = str(box.currentData() or "")
+            self._fill_path_data_combo(box, current)
+
     def _paths_add_row(self, pd: PathDef):
         r = self.tbl_paths.rowCount()
         self.tbl_paths.insertRow(r)
@@ -4278,17 +4606,18 @@ class MainWindow(QMainWindow):
             elem_box.addItem(elem)
         elem_box.setCurrentText(elem)
         self.tbl_paths.setCellWidget(r, 1, elem_box)
-        self.tbl_paths.setItem(r, 2, QTableWidgetItem(pd.label))
+        self.tbl_paths.setCellWidget(r, 2, self._path_data_combo(pd.data, r))
+        self.tbl_paths.setItem(r, 3, QTableWidgetItem(pd.label))
         f = QTableWidgetItem(Path(pd.feff_file).name if pd.feff_file else "")
         f.setFlags(f.flags() & ~Qt.ItemFlag.ItemIsEditable)
         f.setToolTip(pd.feff_file)
         f.setData(Qt.ItemDataRole.UserRole, pd.feff_file)
-        self.tbl_paths.setItem(r, 3, f)
-        self.tbl_paths.setItem(r, 4, QTableWidgetItem(pd.s02))
-        self.tbl_paths.setItem(r, 5, QTableWidgetItem(pd.e0))
-        self.tbl_paths.setItem(r, 6, QTableWidgetItem(pd.deltar))
-        self.tbl_paths.setItem(r, 7, QTableWidgetItem(pd.sigma2))
-        self.tbl_paths.setItem(r, 8, QTableWidgetItem("" if pd.degen is None else f"{pd.degen:g}"))
+        self.tbl_paths.setItem(r, 4, f)
+        self.tbl_paths.setItem(r, 5, QTableWidgetItem(pd.s02))
+        self.tbl_paths.setItem(r, 6, QTableWidgetItem(pd.e0))
+        self.tbl_paths.setItem(r, 7, QTableWidgetItem(pd.deltar))
+        self.tbl_paths.setItem(r, 8, QTableWidgetItem(pd.sigma2))
+        self.tbl_paths.setItem(r, 9, QTableWidgetItem("" if pd.degen is None else f"{pd.degen:g}"))
 
     def _paths_from_table(self) -> List[PathDef]:
         out: List[PathDef] = []
@@ -4299,25 +4628,32 @@ class MainWindow(QMainWindow):
 
             use_it = self.tbl_paths.item(r, 0)
             use = bool(use_it and use_it.checkState() == Qt.CheckState.Checked)
-            f_it = self.tbl_paths.item(r, 3)
+            f_it = self.tbl_paths.item(r, 4)
             feff_file = str(f_it.data(Qt.ItemDataRole.UserRole) or "") if f_it else ""
             degen = None
             try:
-                degen = float(_txt(8)) if _txt(8) else None
+                degen = float(_txt(9)) if _txt(9) else None
             except ValueError:
                 degen = None
             elem_box = self.tbl_paths.cellWidget(r, 1)
             elem = elem_box.currentText().strip() if isinstance(elem_box, QComboBox) else _txt(1)
+            data_box = self.tbl_paths.cellWidget(r, 2)
+            data_tag = (
+                str(data_box.currentData() or "").strip()
+                if isinstance(data_box, QComboBox)
+                else _txt(2)
+            )
             pd = PathDef(
-                label=_txt(2),
+                label=_txt(3),
                 feff_file=feff_file,
                 use=use,
-                s02=_txt(4) or "1.0",
-                e0=_txt(5) or "0.0",
-                deltar=_txt(6) or "0.0",
-                sigma2=_txt(7) or "0.0",
+                s02=_txt(5) or "1.0",
+                e0=_txt(6) or "0.0",
+                deltar=_txt(7) or "0.0",
+                sigma2=_txt(8) or "0.0",
                 degen=degen,
                 elem=elem,
+                data=data_tag,
             )
             # third/ei have no table columns — recover them from the stored PathDef
             stored = use_it.data(Qt.ItemDataRole.UserRole) if use_it else None
@@ -4335,6 +4671,29 @@ class MainWindow(QMainWindow):
         (used_paths, kind): no-element | matched | fallback-untagged | mismatch.
         """
         used_all = [p for p in paths if p.use and p.feff_file]
+        # v4.8.0 Data column: a path assigned to another dataset does not feed
+        # this group ("" = every group of that element).
+        used_all = [
+            p
+            for p in used_all
+            if not str(getattr(p, "data", "") or "").strip()
+            or str(getattr(p, "data", "")).strip() == str(getattr(g, "name", ""))
+        ]
+        # A row assigned to this group replaces an "All" row on the same feff
+        # file ("Copy to…" keeps the All row): two rows on one file would make
+        # larch keep only one of them, silently.
+        own = {
+            os.path.normcase(str(p.feff_file))
+            for p in used_all
+            if str(getattr(p, "data", "") or "").strip() == str(getattr(g, "name", ""))
+        }
+        if own:
+            used_all = [
+                p
+                for p in used_all
+                if str(getattr(p, "data", "") or "").strip()
+                or os.path.normcase(str(p.feff_file)) not in own
+            ]
         ge = (getattr(g, "element", "") or "").strip()
         if not ge:
             return used_all, "no-element"
@@ -4345,6 +4704,943 @@ class MainWindow(QMainWindow):
         if untagged:
             return untagged, "fallback-untagged"
         return [], "mismatch"
+
+    # ========== Structures (CIF) module (v4.7.0) ==========
+    def _cif_library(self) -> Path:
+        """Structure library root (QSettings structures/library_dir)."""
+        raw = str(self.store.value("structures/library_dir", "") or "")
+        path = feff_build.library_dir(raw, create=False)  # writers create sub-folders
+        self._cif_library_path = path
+        return path
+
+    def _cif_reload(self) -> None:
+        lib = self._cif_library()
+        try:
+            self._cif_entries = feff_build.load_structures(lib)
+            self._cif_save_blocked = False
+        except feff_build.StructureLibraryUnreadable as exc:
+            # locked / OneDrive offline: show nothing, and never overwrite it
+            self._cif_entries = []
+            self._cif_save_blocked = True
+            self._log(f"structures.json could not be read; the list is not saved until it can: {exc}")
+        self._cif_counts: dict = {}
+        self._cif_meta_cache: dict = {}
+        self._cif_refresh_table()
+
+    def _cif_save(self) -> None:
+        if getattr(self, "_cif_save_blocked", False):
+            self._log("structures.json was unreadable at load; not overwritten")
+            return
+        try:
+            feff_build.save_structures(self._cif_library(), self._cif_entries)
+        except Exception as exc:
+            self._log(f"structures save failed: {exc}")
+
+    def _cif_busy(self, fn, name: str = "", text: str = ""):
+        """Run one blocking structure/database call off the GUI thread behind a
+        modal busy dialog (same signature as _run_with_busy).
+
+        _run_with_busy alone only animates an open progress dialog: without one
+        the user saw nothing for up to two minutes (CSD) and could click again,
+        nesting a second call.  The dialog that asked (AMCSD / CSD search,
+        structure settings, Settings) is disabled meanwhile, and the busy
+        dialog's Cancel sets an event that _busy_cancelled() reports (the CSD
+        bridge polls it and ends its subprocess tree).
+        """
+        import threading
+
+        owner = QApplication.activeModalWidget()
+        if owner is self:
+            owner = None
+        began = getattr(self, "_load_progress", None) is None
+        if began:
+            self._progress_begin(
+                text or self.i18n.t("progress_reading_short", name=name or "…"),
+                sliding=True,
+                window_title=self.i18n.t("box_cif"),
+            )
+        event = threading.Event()
+        self._busy_cancel_event = event
+        dlg = getattr(self, "_load_progress", None)
+        if dlg is not None:
+            dlg.canceled.connect(event.set)
+        if owner is not None:
+            owner.setEnabled(False)
+        try:
+            return self._run_with_busy(fn, name, text)
+        finally:
+            if owner is not None:
+                owner.setEnabled(True)
+            if dlg is not None and not began:
+                try:
+                    dlg.canceled.disconnect(event.set)
+                except (RuntimeError, TypeError):
+                    pass
+            if began:
+                self._progress_end()
+
+    def _busy_cancelled(self) -> bool:
+        """Thread-safe: was Cancel pressed on the current _cif_busy dialog?"""
+        event = getattr(self, "_busy_cancel_event", None)
+        return bool(event is not None and event.is_set())
+
+    def _cif_read_info(self, cif_path: str, name: str = "") -> dict:
+        return self._cif_busy(
+            lambda: feff_build.structure_info(feff_build.read_cif_text(cif_path)),
+            name or Path(str(cif_path)).name,
+        )
+
+    def _cif_entry_meta(self, entry) -> dict:
+        """Cached source.json of the newest run (first_shell / partial / n_equiv)."""
+        cache = getattr(self, "_cif_meta_cache", None)
+        if cache is None:
+            cache = self._cif_meta_cache = {}
+        if entry.key in cache:
+            return cache[entry.key]
+        meta: dict = {}
+        for run in reversed(list(entry.runs or [])):
+            fp = Path(run) / "source.json"
+            if not fp.is_file():
+                continue
+            try:
+                meta = json.loads(fp.read_text(encoding="utf-8"))
+            except Exception:
+                meta = {}
+            break
+        cache[entry.key] = meta
+        return meta
+
+    def _cif_path_count(self, entry) -> int:
+        cache = getattr(self, "_cif_counts", None)
+        if cache is None:
+            cache = self._cif_counts = {}
+        if entry.key in cache:
+            return cache[entry.key]
+        n = 0
+        for run in entry.runs or []:
+            try:
+                n += len(
+                    [q for q in Path(run).glob("feff*.dat") if q.stat().st_size > 200]
+                )
+            except OSError:
+                continue
+        cache[entry.key] = n
+        return n
+
+    def _cif_refresh_table(self) -> None:
+        if not hasattr(self, "tbl_structs"):
+            return
+        t = self.i18n.t
+        self.tbl_structs.setRowCount(0)
+        for entry in self._cif_entries:
+            row = self.tbl_structs.rowCount()
+            self.tbl_structs.insertRow(row)
+            label = entry.label or entry.source_id or Path(entry.cif_path).stem
+            item = QTableWidgetItem(label)
+            item.setIcon(self._icon_checked if entry.marked else self._icon_unchecked)
+            item.setFlags(
+                (item.flags() | Qt.ItemFlag.ItemIsEnabled)
+                & ~Qt.ItemFlag.ItemIsUserCheckable
+            )
+            item.setData(Qt.ItemDataRole.UserRole, entry.key)
+            tip_lines = [
+                label,
+                f"{entry.source} {entry.source_id}".strip(),
+                entry.cif_path,
+                entry.formula,
+                entry.spacegroup,
+            ]
+            item.setToolTip("\n".join(x for x in tip_lines if x))
+            self.tbl_structs.setItem(row, 0, item)
+            self.tbl_structs.setItem(
+                row, 1, QTableWidgetItem(f"{entry.absorber} {entry.edge}".strip())
+            )
+            site_txt = (
+                t("cif_site_all_short")
+                if str(entry.site) == "all"
+                else f"s{entry.site}"
+            )
+            site_item = QTableWidgetItem(site_txt)
+            meta = self._cif_entry_meta(entry)
+            if meta.get("first_shell"):
+                site_item.setToolTip(str(meta.get("first_shell")))
+            self.tbl_structs.setItem(row, 2, site_item)
+            n_paths = self._cif_path_count(entry)
+            if str(entry.status) == "failed":
+                status = t("cif_status_failed")
+            elif n_paths:
+                status = t("cif_status_paths", n=n_paths)
+            else:
+                status = t("cif_status_pending")
+            partial = bool(meta.get("partial"))
+            if partial:
+                status = "\u26a0 " + status
+            status_item = QTableWidgetItem(status)
+            if str(entry.status) == "failed" and entry.error:
+                status_item.setToolTip(entry.error)
+            elif partial:
+                status_item.setToolTip(t("cif_partial_occ"))
+            self.tbl_structs.setItem(row, 3, status_item)
+        self.tbl_structs.clearSelection()
+
+    def _cif_marked_entries(self) -> list:
+        return [e for e in self._cif_entries if e.marked]
+
+    def _cif_bulk_mark(self, mode: str) -> None:
+        for row, entry in enumerate(self._cif_entries):
+            if hasattr(self, "tbl_structs") and self.tbl_structs.isRowHidden(row):
+                continue  # A/U/I never reach filtered-out rows
+            entry.marked = (
+                True if mode == "all" else False if mode == "none" else not entry.marked
+            )
+        self._cif_save()
+        self._cif_refresh_table()
+
+    def _cif_cell_clicked(self, row: int, col: int) -> None:
+        self.tbl_structs.clearSelection()
+        if col != 0 or row < 0 or row >= len(self._cif_entries):
+            return
+        item = self.tbl_structs.item(row, 0)
+        if item is None:
+            return
+        rect = self.tbl_structs.visualItemRect(item)
+        pos = self.tbl_structs.viewport().mapFromGlobal(QCursor.pos())
+        if not (rect.left() - 2 <= pos.x() <= rect.left() + 28):
+            return
+        entry = self._cif_entries[row]
+        entry.marked = not entry.marked
+        self._cif_save()
+        self._cif_refresh_table()
+
+    def _cif_cell_double_clicked(self, row: int, _col: int) -> None:
+        if 0 <= row < len(self._cif_entries):
+            self._cif_edit_entry(self._cif_entries[row])
+
+    def _cif_edit_entry(self, entry) -> None:
+        try:
+            info = self._cif_read_info(entry.cif_path, entry.label)
+            elements = info.get("elements") or []
+        except Exception as exc:
+            QMessageBox.warning(self, self.i18n.t("box_cif"), self.i18n.t("cif_read_failed", msg=str(exc)))
+            return
+        dlg = StructureSettingsDialog(
+            self,
+            t=self.i18n.t,
+            bi=self._bi,
+            entry=entry,
+            elements=elements,
+            run_busy=self._cif_busy,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        values = dlg.result_values()
+        changed = any(str(getattr(entry, k)) != str(v) for k, v in values.items())
+        for key, value in values.items():
+            setattr(entry, key, value)
+        if changed:
+            # Settings changed: previous FEFF runs no longer describe this entry.
+            entry.runs = []
+            entry.status = "pending"
+            entry.error = ""
+            getattr(self, "_cif_counts", {}).pop(entry.key, None)
+            getattr(self, "_cif_meta_cache", {}).pop(entry.key, None)
+        self._cif_save()
+        self._cif_refresh_table()
+
+    def _cif_context_menu(self, pos) -> None:
+        row = self.tbl_structs.rowAt(pos.y())
+        if row < 0 or row >= len(self._cif_entries):
+            return
+        entry = self._cif_entries[row]
+        menu = QMenu(self)
+        act_edit = menu.addAction(self.i18n.t("cif_settings"))
+        act_open = menu.addAction(self.i18n.t("cif_open_folder"))
+        menu.addSeparator()
+        act_remove = menu.addAction(self.i18n.t("cif_remove"))
+        chosen = menu.exec(self.tbl_structs.viewport().mapToGlobal(pos))
+        if chosen is act_edit:
+            self._cif_edit_entry(entry)
+        elif chosen is act_open:
+            folder = Path(entry.cif_path).parent
+            try:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+            except Exception as exc:
+                self._log(f"open folder failed: {exc}")
+        elif chosen is act_remove:
+            self._cif_remove_entry(entry)
+
+    def _cif_remove_entry(self, entry) -> None:
+        """Drop one row from the library list — never delete its files."""
+        self._cif_entries = [e for e in self._cif_entries if e is not entry]
+        self._cif_save()
+        self._cif_refresh_table()
+        self._log(f"structure removed from the list (files kept): {entry.label}")
+
+    def _cif_default_absorber(self, elements) -> str:
+        current = self.project.current
+        ce = str(getattr(current, "element", "") or "").strip()
+        if ce and ce in elements:
+            return ce
+        for el in elements:
+            if el not in ("O", "H"):
+                return el
+        return elements[0] if elements else ""
+
+    def _cif_default_edge(self, absorber: str) -> str:
+        current = self.project.current
+        ce = str(getattr(current, "element", "") or "").strip()
+        if ce and ce.lower() == absorber.lower():
+            edge = str(getattr(current, "edge", "") or "").strip()
+            if edge:
+                return edge
+        try:
+            from xraydb import atomic_number
+
+            z = atomic_number(absorber) or 0
+        except Exception:
+            z = 0
+        return "K" if z < 58 else "L3"
+
+    def _cif_unique_key(self, base: str) -> str:
+        key = feff_build._ascii_name(base, "structure")
+        taken = {e.key for e in self._cif_entries}
+        if key not in taken:
+            return key
+        for i in range(2, 1000):
+            cand = f"{key}_{i}"
+            if cand not in taken:
+                return cand
+        return f"{key}_{len(taken)}"
+
+    def _cif_fill_absorbers(self, entries) -> None:
+        """AMCSD / CSD rows arrive without an absorber: pick it like a local CIF
+        (current group's element if present, else the first non-O/H element)."""
+        for entry in entries:
+            if str(entry.absorber or "").strip():
+                continue
+            try:
+                info = self._cif_read_info(entry.cif_path, entry.label)
+            except Exception as exc:
+                self._log(f"structure read failed [{entry.label}]: {exc}")
+                continue
+            entry.absorber = self._cif_default_absorber(info.get("elements") or [])
+            entry.edge = self._cif_default_edge(entry.absorber)
+            entry.formula = entry.formula or info.get("formula", "")
+            entry.spacegroup = entry.spacegroup or info.get("spacegroup", "")
+
+    def _cif_add_entries(self, entries) -> None:
+        entries = list(entries or [])
+        self._cif_fill_absorbers(entries)
+        for entry in entries:
+            entry.key = self._cif_unique_key(entry.key or f"{entry.label}_{entry.absorber}")
+            self._cif_entries.append(entry)
+            self._log(f"structure added: {entry.label} ({entry.source} {entry.source_id})")
+        self._cif_save()
+        self._cif_refresh_table()
+
+    def _cif_add_files(self) -> None:
+        start = str(self._cif_library())
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            self.i18n.t("cif_add_files"),
+            start,
+            "CIF (*.cif);;All files (*.*)",
+            options=QFileDialog.Option.DontUseNativeDialog,
+        )
+        if not files:
+            return
+        errors = []
+        new_entries = []
+        # pymatgen/spglib reads (3–4 s cold) run off the GUI thread
+        self._progress_begin(
+            self.i18n.t("cif_add_files"), sliding=True, window_title=self.i18n.t("box_cif")
+        )
+        try:
+            infos = []
+            for fp in files:
+                if self._load_progress is not None and self._load_progress.wasCanceled():
+                    break
+                try:
+                    infos.append((fp, self._cif_read_info(fp)))
+                except Exception as exc:
+                    errors.append({"path": fp, "detail": str(exc)})
+        finally:
+            self._progress_end()
+        for fp, info in infos:
+            elements = info.get("elements") or []
+            absorber = self._cif_default_absorber(elements)
+            label = Path(fp).stem
+            new_entries.append(
+                feff_build.StructureEntry(
+                    key=self._cif_unique_key(f"{label}_{absorber}"),
+                    source="file",
+                    source_id=Path(fp).name,
+                    cif_path=str(fp),
+                    label=label,
+                    formula=info.get("formula", ""),
+                    spacegroup=info.get("spacegroup", ""),
+                    absorber=absorber,
+                    edge=self._cif_default_edge(absorber),
+                )
+            )
+        if new_entries:
+            self._cif_add_entries(new_entries)
+        if errors:
+            self._show_import_error_summary(errors)
+
+    def _open_amcsd(self) -> None:
+        """AMCSD is a source of the CIF search window (v4.11.0)."""
+        self._open_ccdc(source="amcsd")
+
+    def _ccdc_record(self) -> dict:
+        raw = str(self.store.value("ccdc/last_verify", "") or "")
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _ccdc_available(self) -> bool:
+        record = self._ccdc_record()
+        return bool(record.get("ok")) and bool(str(self.store.value("ccdc/python", "") or ""))
+
+    def _offline_cif_library(self) -> str:
+        """Settings -> Databases offline CIF library (zip or folder), "" if unset/missing."""
+        raw = str(self.store.value("structures/offline_lib", "") or "").strip()
+        return raw if raw and Path(raw).exists() else ""
+
+    def _refresh_ccdc_button(self) -> None:
+        # v4.11.0: the button opens the CIF search (offline library, COD, CCDC):
+        # always usable; the dialog explains what is not configured
+        if not hasattr(self, "btn_cif_ccdc"):
+            return
+        self.btn_cif_ccdc.setEnabled(True)
+        self.btn_cif_ccdc.setToolTip(self.i18n.t("cif_ccdc_tip"))
+
+    def _open_ccdc(self, source: str = "") -> None:
+        cur = self.project.current
+        element = str(getattr(cur, "element", "") or "").strip()
+        offline = self._offline_cif_library()
+        dlg = CifSearchDialog(
+            self,
+            t=self.i18n.t,
+            bi=self._bi,
+            lib_dir=self._cif_library(),
+            run_busy=self._cif_busy,
+            on_add=self._cif_add_entries,
+            offline_source=offline,
+            python=str(self.store.value("ccdc/python", "") or ""),
+            ccdc_ok=self._ccdc_available(),
+            default_elements=[element] if element else [],
+            source=source,
+            cancelled=self._busy_cancelled,
+        )
+        dlg.exec()
+
+    def _ccdc_fail_text(self, kind: str, message: str = "") -> str:
+        """Bilingual text for a failed CSD call; an unknown kind never shows a raw key."""
+        kind = {"not_found": "notfound"}.get(str(kind or "other"), str(kind or "other"))
+        if kind != "other":
+            key = f"ccdc_fail_{kind}"
+            text = self.i18n.t(key)
+            if text and text != key:
+                return text
+        return self.i18n.t("ccdc_fail_other", msg=str(message or kind)[:400])
+
+    def _verify_ccdc(self, edit, label) -> None:
+        """Verify the CSD Python and remember the outcome in QSettings."""
+        python = str(edit.text() or "").strip()
+        if not python:
+            QMessageBox.information(
+                self, self.i18n.t("settings_db_block"), self.i18n.t("ccdc_fail_notfound")
+            )
+            return
+        try:
+            answer = self._cif_busy(
+                lambda: ccdc_bridge.verify(python, cancel=self._busy_cancelled),
+                "CSD",
+                self.i18n.t("ccdc_verify"),
+            )
+        except Exception as exc:
+            answer = {"ok": False, "kind": "other", "message": str(exc)}
+        if answer.get("kind") == "cancelled":
+            # a cancelled verify says nothing about the connection: keep the old record
+            self._log("CCDC verify cancelled")
+            return
+        ok = bool(answer.get("ok"))
+        kind = str(answer.get("kind") or "other")
+        record = {
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "ok": ok,
+            "kind": kind,
+            "version": str(answer.get("csd_version", "") or ""),
+            "n_entries": answer.get("n_entries"),
+            "message": str(answer.get("message", "") or "")[:400],
+        }
+        self.store.setValue("ccdc/last_verify", json.dumps(record))
+        if ok:
+            self.store.setValue("ccdc/python", python)
+            label.setText(
+                self.i18n.t(
+                    "ccdc_ok",
+                    ver=record["version"] or "?",
+                    n=record["n_entries"] if record["n_entries"] is not None else "?",
+                )
+            )
+        else:
+            label.setText(self._ccdc_fail_text(kind, record["message"]))
+        self._log(f"CCDC verify: {'OK' if ok else kind} ({record['message'] or record['version']})")
+        self._refresh_ccdc_button()
+
+    def _choose_cif_folder(self) -> str:
+        """Pick the structure library folder (Settings → Databases); "" if cancelled."""
+        start = str(self._cif_library())
+        folder = _pick_directory(self, self.i18n.t("cif_folder_title"), start)
+        if not folder:
+            return ""
+        self.store.setValue("structures/library_dir", folder)
+        self._log(self.i18n.t("cif_folder_changed", path=folder))
+        self._cif_reload()
+        return folder
+
+    def _cif_run_feff(self, entries=None) -> list:
+        """Run FEFF6 for the given (or marked) entries that have no run yet."""
+        if getattr(self, "_cif_running", False):
+            return []
+        source = list(entries) if entries is not None else self._cif_marked_entries()
+        targets = [e for e in source if not self._cif_path_count(e)]
+        if not targets:
+            if entries is None:
+                QMessageBox.information(
+                    self, self.i18n.t("box_cif"), self.i18n.t("cif_none_marked")
+                )
+            return []
+        lib = self._cif_library()
+        self._cif_running = True
+        errors = []
+        self._progress_begin(
+            self.i18n.t("cif_running", name="", i=0, n=len(targets)),
+            sliding=True,
+            window_title=self.i18n.t("box_cif"),
+        )
+        try:
+            for i, entry in enumerate(targets):
+                if not self._progress_update(
+                    0,
+                    self.i18n.t(
+                        "cif_running", name=entry.label, i=i + 1, n=len(targets)
+                    ),
+                ):
+                    break
+                try:
+                    runs = self._run_with_busy(
+                        lambda e=entry: feff_build.run_structure(e, lib),
+                        entry.label,
+                        self.i18n.t("cif_run"),
+                    )
+                    entry.runs = list(runs or [])
+                    entry.status = "ok"
+                    entry.error = ""
+                    getattr(self, "_cif_counts", {}).pop(entry.key, None)
+                    getattr(self, "_cif_meta_cache", {}).pop(entry.key, None)
+                    self._log(
+                        f"FEFF done: {entry.label} -> {len(entry.runs)} run(s)"
+                    )
+                except Exception as exc:
+                    entry.status = "failed"
+                    entry.error = str(exc)
+                    errors.append({"path": entry.cif_path, "detail": f"{entry.label}: {exc}"})
+                    self._log(f"FEFF failed [{entry.label}]: {str(exc)[:300]}")
+                self._cif_save()
+                self._cif_refresh_table()
+        finally:
+            self._progress_end()
+            self._cif_running = False
+        if errors:
+            self._show_import_error_summary(errors)
+        return targets
+
+    def _cif_paths_for_entries(self, entries) -> list:
+        out = []
+        for entry in entries:
+            for run in entry.runs or []:
+                if Path(run).is_dir():
+                    out.extend(feff_build.parse_feff_paths(run, entry.label))
+        return out
+
+    def _cif_add_path_rows(self, pathdefs) -> None:
+        for pd in pathdefs or []:
+            self._paths_add_row(pd)
+        self._log(f"paths added from structures: {len(pathdefs or [])}")
+
+    def _cif_s02(self) -> float:
+        try:
+            return float(self.store.value("structures/s02", 0.90) or 0.90)
+        except (TypeError, ValueError):
+            return 0.90
+
+    def _cif_path_dialog(self, paths, marked=None, auto_model: bool = False):
+        fs = self._build_fit_settings_from_ui()
+        dlg = PathPickDialog(
+            self,
+            t=self.i18n.t,
+            bi=self._bi,
+            paths=paths,
+            windows=fs,
+            s02=self._cif_s02(),
+            rmax=fs.rmax + 0.5,
+            on_add_paths=self._cif_add_path_rows,
+            on_model=self._apply_starting_model,
+            marked=marked,
+            show_per_dataset=False,
+            auto_model=auto_model,
+        )
+        dlg.exec()
+        try:
+            self.store.setValue("structures/s02", float(dlg.sp_s02.value()))
+        except Exception:
+            pass
+        return dlg
+
+    def _cif_pick_paths(self) -> None:
+        entries = [e for e in self._cif_marked_entries() if e.runs]
+        if not entries:
+            QMessageBox.information(
+                self, self.i18n.t("box_cif"), self.i18n.t("cif_none_marked")
+            )
+            return
+        paths = self._cif_paths_for_entries(entries)
+        if not paths:
+            QMessageBox.information(
+                self, self.i18n.t("box_cif"), self.i18n.t("cif_none_marked")
+            )
+            return
+        self._cif_path_dialog(paths)
+
+    def _cif_quick_check(self) -> None:
+        """Quick check (v4.11.0): which ticked structure looks like the data.
+
+        One minimal single-phase fit per structure — N fixed at the
+        crystallographic value, S0² fixed, single scattering only — ranked by
+        R-factor. The GDS and path tables are left alone; Auto fit builds and
+        fits the real model.
+        """
+        cur = self._fit_ready_current()
+        if cur is None:
+            return
+        entries = self._auto_model_entries()
+        if not entries:
+            QMessageBox.information(
+                self, self.i18n.t("box_cif"), self.i18n.t("qc_need_marked")
+            )
+            return
+        self._cif_run_feff(entries=entries)
+        entries = [e for e in entries if e.runs]
+        if not entries:
+            return
+        windows = self._build_fit_settings_from_ui()
+        snapshot = cur.session.snapshot_group_for_fit()
+        s02 = self._cif_s02()
+        rows = []
+        self._progress_begin(
+            self.i18n.t("cif_quick_check"), maximum=len(entries),
+            window_title=self.i18n.t("box_cif"),
+        )
+        try:
+            for i, entry in enumerate(entries):
+                if not self._progress_update(i, f"{entry.label} ({i + 1}/{len(entries)})"):
+                    break
+                row = {"label": entry.label, "ok": False}
+                try:
+                    search = single_phase_search(
+                        lambda gds, paths: run_feffit(snapshot, gds, paths, windows),
+                        self._cif_paths_for_entries([entry]),
+                        s02,
+                        False,
+                        False,
+                        windows=windows,
+                    )
+                    tried = (search.steps[0].get("tried") or [{}])[0] if search.steps else {}
+                    result = tried.get("result")
+                    st = dict(getattr(result, "statistics", {}) or {})
+                    row.update(
+                        {
+                            "ok": bool(tried.get("ok")),
+                            "r_factor": tried.get("r_factor"),
+                            "chi_square": tried.get("chi_square"),
+                            # run_feffit says "redchi"; the Model A runner "reduced_chi_square"
+                            "redchi": st.get("redchi", st.get("reduced_chi_square")),
+                            "audit_level": str(tried.get("audit_verdict") or ""),
+                            "flags": list(tried.get("flags") or []),
+                            "error": str(tried.get("error") or search.error or ""),
+                        }
+                    )
+                except Exception as exc:
+                    row["error"] = str(exc)[:200]
+                rows.append(row)
+            self._progress_update(len(entries), self.i18n.t("progress_done"))
+        finally:
+            self._progress_end()
+
+        def _r(row):
+            value = row.get("r_factor")
+            ok = row.get("ok") and isinstance(value, (int, float)) and value == value
+            return float(value) if ok else float("inf")
+
+        rows.sort(key=_r)
+        for row in rows:
+            self._log(
+                f"quick check {row['label']}: R={row.get('r_factor')} "
+                f"audit={row.get('audit_level') or '-'} {row.get('error') or ''}".rstrip()
+            )
+
+        def _keep_only(label: str) -> None:
+            for entry in self._cif_entries:
+                entry.marked = entry.label == label
+            self._cif_save()
+            self._cif_refresh_table()
+
+        QuickCheckDialog(
+            self, t=self.i18n.t, bi=self._bi, rows=rows, on_keep=_keep_only
+        ).exec()
+
+    def _apply_starting_model(self, gds, pathdefs, report, auto_fit: bool) -> None:
+        """Replace the GDS + path tables with a starting model (undoable)."""
+        self._push_module_undo("auto_fit", [], fit_ui=self._snapshot_fit_ui())
+        self.tbl_gds.setRowCount(0)
+        for param in gds:
+            self._gds_add_row(param)
+        self.tbl_paths.setRowCount(0)
+        for pd in pathdefs:
+            self._paths_add_row(pd)
+        shells = report.get("shells") or []
+        nidp = float(report.get("nidp", float("nan")))
+        self._log(
+            "starting model: "
+            + ", ".join(
+                f"{s.get('tag')}(Reff {float(s.get('reff', 0)):.3f})" for s in shells
+            )
+            + f"; nvar {report.get('nvar')} / nidp {nidp:.1f}"
+        )
+        self._refresh_fit_panel()
+        if auto_fit:  # the model was just built: fit the tables, never rebuild
+            self._auto_fit_tables(self._scope_from_module("auto_fit"))
+
+    def _compare_snapshots_text(self, snap_a: dict, snap_b: dict) -> str:
+        """Run one Hamilton comparison; return the bilingual result line."""
+        t = self.i18n.t
+        result = compare_snapshots(snap_a or {}, snap_b or {})
+        if not result.get("comparable"):
+            why = t(str(result.get("why") or "hamilton_why_missing"))
+            return t("hamilton_not_comparable", why=why)
+        verdict = t(
+            {
+                "significant": "hamilton_sig",
+                "not_significant": "hamilton_not_sig",
+                "not_better": "hamilton_not_better",
+            }.get(str(result.get("verdict")), "hamilton_not_sig")
+        )
+        if result.get("b") is None:
+            return t("hamilton_not_comparable", why=t("hamilton_why_missing"))
+        self._model_comparisons.append(
+            {
+                "data": str((snap_a or {}).get("data", "")),
+                "base_stamp": str(result.get("base_stamp", "")),
+                "ext_stamp": str(result.get("ext_stamp", "")),
+                "p": float(result["p"]),
+                "F": float(result["F"]),
+                "b": int(result["b"]),
+                "dof": float(result["dof"]),
+                "verdict": str(result.get("verdict", "")),
+            }
+        )
+        return t(
+            "hamilton_result",
+            p=float(result["p"]),
+            f=float(result["F"]),
+            b=int(result["b"]),
+            dof=float(result["dof"]),
+            verdict=verdict,
+        )
+
+    def _compare_fits_dialog(self) -> None:
+        rows = list_fit_history(self._history_cache_dir())
+        if len(rows) < 2:
+            QMessageBox.information(
+                self, self.i18n.t("hamilton_title"), self.i18n.t("hist_empty")
+            )
+            return
+        t = self.i18n.t
+        dlg = QDialog(self)
+        dlg.setWindowTitle(t("hamilton_title"))
+        dlg.resize(560, 320)
+        lay = QVBoxLayout(dlg)
+        form = QFormLayout()
+        cmb_a = QComboBox()
+        cmb_b = QComboBox()
+        for row in rows:
+            rf = row.get("r_factor")
+            rf_s = f"R={rf:.4f}" if isinstance(rf, (int, float)) and np.isfinite(rf) else "R=?"
+            label = f"{row.get('stamp', '')}  {rf_s}  {row.get('data', '')}"
+            cmb_a.addItem(label, row.get("file"))
+            cmb_b.addItem(label, row.get("file"))
+        if cmb_b.count() > 1:
+            cmb_b.setCurrentIndex(1)
+        form.addRow(QLabel("A"), cmb_a)
+        form.addRow(QLabel("B"), cmb_b)
+        lay.addLayout(form)
+        out = QPlainTextEdit()
+        out.setReadOnly(True)
+        out.setMinimumHeight(120)
+        lay.addWidget(out, 1)
+        row_btns = QHBoxLayout()
+        btn_run = QPushButton(t("hamilton_run"))
+        btn_close = QPushButton(self._bi("关闭", "Close"))
+        row_btns.addWidget(btn_run)
+        row_btns.addStretch(1)
+        row_btns.addWidget(btn_close)
+        lay.addLayout(row_btns)
+
+        def _run() -> None:
+            try:
+                snap_a = load_fit_snapshot(cmb_a.currentData())
+                snap_b = load_fit_snapshot(cmb_b.currentData())
+            except Exception as exc:
+                out.setPlainText(f"{exc}")
+                return
+            text = self._compare_snapshots_text(snap_a, snap_b)
+            out.setPlainText(text)
+            self._log(text)
+
+        btn_run.clicked.connect(_run)
+        btn_close.clicked.connect(dlg.accept)
+        dlg.exec()
+
+    def _available_paths_evidence(self, feff_files, rmax: float) -> list:
+        """Single-scattering paths FEFF made but the table does not use."""
+        used = set()
+        for f in feff_files:
+            try:
+                used.add(str(Path(f).resolve()).lower())
+            except OSError:
+                used.add(str(f).lower())
+        out = []
+        seen = []
+        for f in feff_files:
+            folder = str(Path(f).parent)
+            if folder.lower() in [d.lower() for d in seen]:
+                continue
+            seen.append(folder)
+            if not (Path(folder) / "source.json").is_file():
+                continue
+            try:
+                infos = feff_build.parse_feff_paths(folder)
+            except Exception:
+                continue
+            room = 12
+            for info in infos:
+                if room <= 0:
+                    break
+                if not info.single_scattering:
+                    continue
+                if not (float(info.reff) <= float(rmax) + 0.5):
+                    continue
+                if str(Path(info.feff_file).resolve()).lower() in used:
+                    continue
+                out.append(
+                    {
+                        "source": Path(folder).name,
+                        "reff": round(float(info.reff), 3),
+                        "degen": float(info.degen),
+                        "atoms": info.atoms,
+                    }
+                )
+                room -= 1
+        return out
+
+    def _structure_evidence(self, result) -> dict:
+        """Structure / path / budget evidence for one finished fit (AI Check)."""
+        feff_files = [
+            str((p or {}).get("feff_file", "")) for p in (result.paths or [])
+        ]
+        feff_files = [f for f in feff_files if f]
+        models = feff_build.structure_models_for(feff_files)
+        try:
+            fs = self._build_fit_settings_from_ui()
+            rmax = float(fs.rmax)
+        except Exception:
+            rmax = 4.0
+        available = self._available_paths_evidence(feff_files, rmax)
+        stats = dict(result.statistics or {})
+        s02 = []
+        for name, info in (result.params or {}).items():
+            if not str(name).startswith("s02"):
+                continue
+            info = info if isinstance(info, dict) else {}
+            s02.append(
+                {
+                    "name": str(name),
+                    "value": info.get("value"),
+                    "kind": info.get("kind", ""),
+                }
+            )
+        current = self.project.current
+        name = str(getattr(current, "name", "") or "")
+        return {
+            "structure_models": models,
+            "available_paths": available,
+            "budget": {
+                "n_independent": stats.get("n_independent"),
+                "n_varys": stats.get("n_varys"),
+                "s02": s02,
+            },
+            "model_comparisons": [
+                c for c in (self._model_comparisons or []) if c.get("data") == name
+            ],
+        }
+
+    def _paths_context_menu(self, pos) -> None:
+        menu = QMenu(self)
+        act = menu.addAction(self.i18n.t("path_copy_to"))
+        chosen = menu.exec(self.tbl_paths.viewport().mapToGlobal(pos))
+        if chosen is act:
+            self._copy_paths_to_groups()
+
+    def _selected_path_rows(self) -> List[int]:
+        return sorted({i.row() for i in self.tbl_paths.selectedIndexes()})
+
+    def _copy_paths_to_groups(self) -> None:
+        """Duplicate the selected path rows with a per-dataset Data value."""
+        rows = self._selected_path_rows()
+        if not rows:
+            self._log(self._bi("先在路径表里选中要复制的行", "Select the path rows to copy first"))
+            return
+        names = [g.name for g in self._marked_groups_for_scope()]
+        if not names:
+            self._log(self._bi("先标记数据组再复制路径", "Mark data groups before copying paths"))
+            return
+        dlg = CopyToGroupsDialog(
+            self, t=self.i18n.t, bi=self._bi, names=names
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        targets = dlg.selected_names()
+        if not targets:
+            self._log(self._bi("没有勾选数据组", "No data group ticked"))
+            return
+        paths = self._paths_from_table()
+        copied = 0
+        for row in rows:
+            if row >= len(paths):
+                continue
+            base = paths[row]
+            for name in targets:
+                np_def = PathDef(**{**base.to_dict(), "data": name})
+                self._paths_add_row(np_def)
+                copied += 1
+        self._log(f"paths copied to datasets: {copied}")
 
     def _del_selected_rows(self, tbl: QTableWidget):
         rows = sorted({i.row() for i in tbl.selectedIndexes()}, reverse=True)
@@ -4660,14 +5956,14 @@ class MainWindow(QMainWindow):
         return rect.left() - 2 <= pos.x() <= rect.left() + 28
 
     def _make_scope_action_row(
-        self, module: str, run_btn: "QPushButton", undo_btn=None, extra=None
+        self, module: str, run_btn: "QPushButton", undo_btn=None, extra=None, tight=False
     ) -> Tuple["QWidget", "QPushButton"]:
         """
         Build [run_btn] ○ Current ○ Marked ○ All [↶] for a module.
         Radios are exclusive; default = Current.
         """
         rad_cur, rad_mk, rad_all = self._make_scope_radios(module)
-        host = _action_scope_row(run_btn, rad_cur, rad_mk, rad_all, undo_btn, extra)
+        host = _action_scope_row(run_btn, rad_cur, rad_mk, rad_all, undo_btn, extra, tight=tight)
         if extra is None:
             # rows with an extra field keep the button at its own width so
             # the row still fits; the others share one width
@@ -4997,6 +6293,9 @@ class MainWindow(QMainWindow):
         g = self.project.set_current(gid)
         if g:
             self.last_fit = None  # fit overlay belongs to the previous group's data
+            # ...unless this group is a member of the last joint fit (v4.8.0):
+            # then it shows its own curves from that (still valid) result.
+            self.last_fit = self._joint_view_for(g)
             self._repaint_group_list_items()
             self.list_groups.clearSelection()
             self._load_group_to_controls(g)
@@ -5447,7 +6746,9 @@ class MainWindow(QMainWindow):
             else:
                 note = str((res.info or {}).get("phase_note") or "")
                 self._log(self.i18n.t("phase_need_feff") + (f" ({note})" if note else ""))
-        self.last_fit = None  # processed data changed — stale fit overlay must go
+        # processed data changed — a stale fit overlay must go; a joint view
+        # survives while the group object is still the fitted one (a memo hit)
+        self.last_fit = self._joint_view_for(g)
         self._replot(preserve_view=preserve_view)
         return 0
 
@@ -6952,6 +8253,20 @@ class MainWindow(QMainWindow):
         if not isinstance(fit, dict):
             return applied
         gds = list(fit.get("gds") or [])
+        if gds and getattr(self, "last_joint_fit", None) is not None:
+            kept = []
+            for patch in gds:
+                name = str(patch.get("name") or "").strip()
+                if name and self._joint_patch_is_copy(name):
+                    self._log(
+                        "AI Check GDS patch skipped ("
+                        + self.i18n.t("ai_patch_ds_copy")
+                        + "): "
+                        + name
+                    )
+                    continue
+                kept.append(patch)
+            gds = kept
         if gds:
             if scope != "current":
                 self._log(
@@ -7103,7 +8418,101 @@ class MainWindow(QMainWindow):
                 return False
         return True
 
+    # ========== Fitting mode / parameter audit (v4.9.0) ==========
+    # (mode, phase cap) per item of the one Auto-fit-row dropdown (v4.11.0)
+    STRUCT_MODES = (("single", 1), ("mixed", 2), ("mixed", 3), ("mixed", 4))
+
+    def _struct_mode_item(self) -> tuple:
+        if not hasattr(self, "cmb_struct_mode"):
+            return ("single", 1)
+        raw = str(self.cmb_struct_mode.currentData() or "single:1")
+        mode, _sep, n = raw.partition(":")
+        try:
+            return ("mixed" if mode == "mixed" else "single", int(n or 1))
+        except ValueError:
+            return ("single", 1)
+
+    def _struct_mode(self) -> str:
+        return self._struct_mode_item()[0]
+
+    def _max_phases(self) -> int:
+        """Phase cap of a mixed fit; single phase keeps the last mixed cap."""
+        mode, n = self._struct_mode_item()
+        if mode == "mixed":
+            return n
+        try:
+            return max(2, min(4, int(self.store.value("structures/max_phases", 2))))
+        except (TypeError, ValueError):
+            return 2
+
+    def _retranslate_struct_mode(self) -> None:
+        t = self.i18n.t
+        combo = self.cmb_struct_mode
+        combo.blockSignals(True)
+        for i, (mode, n) in enumerate(self.STRUCT_MODES):
+            combo.setItemText(
+                i, t("struct_mode_single") if mode == "single" else t("struct_mode_mixed_n", n=n)
+            )
+        combo.blockSignals(False)
+        combo.setToolTip(t("struct_mode_tip") + "\n" + t("max_phases_tip"))
+
+    def _restore_struct_mode(self) -> None:
+        """QSettings round-trip for the mode / phase-cap dropdown."""
+        if not hasattr(self, "cmb_struct_mode"):
+            return
+        saved = str(self.store.value("structures/fit_mode", "") or "")
+        try:
+            maxp = max(2, min(4, int(self.store.value("structures/max_phases", 2))))
+        except (TypeError, ValueError):
+            maxp = 2
+        key = f"mixed:{maxp}" if saved == "mixed" else "single:1"
+        idx = self.cmb_struct_mode.findData(key)
+        self.cmb_struct_mode.blockSignals(True)
+        self.cmb_struct_mode.setCurrentIndex(idx if idx >= 0 else 0)
+        self.cmb_struct_mode.blockSignals(False)
+        self._struct_mode_changed()
+
+    def _struct_mode_changed(self, *_args) -> None:
+        mode, n = self._struct_mode_item()
+        try:
+            self.store.setValue("structures/fit_mode", mode)
+            if mode == "mixed":
+                self.store.setValue("structures/max_phases", int(n))
+        except Exception:
+            pass
+
+    def _audit_tooltip(self, flags) -> str:
+        """Bilingual one-line-per-flag tooltip (falls back to the ASCII form)."""
+        t = self.i18n.t
+        lines = []
+        for f in flags or []:
+            key = f"audit_{getattr(f, 'code', '')}"
+            try:
+                lines.append(t(key, p=f.param, v=f.value, lim=f.limit))
+            except Exception:
+                lines.append(format_flags([f]))
+        return chr(10).join(line for line in lines if line)
+
+    def _audit_result(self, result: FitResult, gds, mode: str = "generic") -> list:
+        """Attach the parameter audit to one finished fit (all fits get one)."""
+        try:
+            flags = audit_fit(result, gds, mode=mode)
+        except Exception:
+            flags = []
+        result.audit = [f.to_dict() for f in flags]
+        result.fit_mode = str(mode or "")
+        return flags
+
     def _auto_fit(self, scope: str = "current") -> None:
+        """Auto fit (v4.11.0): with structures ticked, the whole chain from CIF
+        (FEFF → model in the chosen phase mode → fit → coordination numbers);
+        otherwise fit the current GDS / path tables."""
+        if self._cif_marked_entries():
+            self._auto_fit_from_structures(scope)
+            return
+        self._auto_fit_tables(scope)
+
+    def _auto_fit_tables(self, scope: str = "current") -> None:
         """
         Batch fit Current / Marked / All with the current GDS / paths / windows.
         Snapshots fit panel for Undo.
@@ -7181,6 +8590,12 @@ class MainWindow(QMainWindow):
                         )
                     result = run_feffit(group, gds, used_g, fs)
                     if isinstance(result, FitResult) and result.ok:
+                        flags = self._audit_result(result, gds, "generic")
+                        if flags:
+                            self._log(
+                                f"audit [{g.name}]: "
+                                + " ".join(f"{f.level}:{f.code}" for f in flags)
+                            )
                         n_ok += 1
                         last_report = result.to_text()
                         last_result = result
@@ -7188,6 +8603,7 @@ class MainWindow(QMainWindow):
                             save_fit_to_history(
                                 result, gds, used_g, fs, data_desc=g.name,
                                 history_dir=self._history_cache_dir(),
+                                structure_models=feff_build.structure_models_for(used_g),
                             )
                         except Exception as exc:
                             self._log(f"history save failed [{g.name}]: {exc}")
@@ -7231,6 +8647,746 @@ class MainWindow(QMainWindow):
             return
         self._undo_module("auto_fit")
         self._refresh_fit_panel()
+
+    # ========== Joint fit (v4.8.0) ==========
+    @staticmethod
+    def _fit_settings_from_athena(s) -> FitSettings:
+        """One dataset's FT windows from its own AthenaSettings."""
+        return FitSettings(
+            kmin=float(s.kmin),
+            kmax=float(s.kmax),
+            dk=float(s.dk),
+            kwindow=str(s.kwindow),
+            kw_list=(1, 2, 3),
+            rmin=float(s.rmin),
+            rmax=float(s.rmax),
+            dr=float(s.dr),
+            rwindow=str(s.rwindow),
+            fit_space="r",
+            rbkg=float(getattr(s, "rbkg", 1.0) or 1.0),
+        )
+
+    def _joint_fit_set(self) -> list:
+        """The fit set: marked groups inside the element filter, in list order."""
+        return list(self._marked_groups_for_scope())
+
+    def _refresh_joint_table(self, result=None) -> None:
+        if not hasattr(self, "tbl_joint"):
+            return
+        t = self.i18n.t
+        groups = self._joint_fit_set()
+        if hasattr(self, "lbl_joint_hint"):
+            self.lbl_joint_hint.setText(t("joint_fit_hint", n=len(groups)))
+        current = result if isinstance(result, FitResult) else getattr(self, "last_joint_fit", None)
+        rows = []
+        if isinstance(current, FitResult) and current.ok and current.datasets:
+            # datasets follow the fit set's order; names need not be unique
+            ids = list(getattr(self, "_joint_group_ids", []) or [])
+            by_name = {g.name: g for g in self.project.groups}
+            for i, row in enumerate(current.datasets):
+                name = str(row.get("name", ""))
+                if len(ids) == len(current.datasets):
+                    gid = ids[i]
+                else:
+                    gid = by_name.get(name).id if by_name.get(name) is not None else ""
+                rows.append(
+                    (
+                        str(row.get("tag", "")),
+                        name,
+                        row.get("settings") or {},
+                        row.get("r_factor"),
+                        gid,
+                    )
+                )
+        else:
+            taken: list = []
+            for g in groups:
+                tag = dataset_tag(g.name, taken)
+                taken.append(tag)
+                s = self._fit_settings_from_athena(g.settings)
+                rows.append(
+                    (
+                        tag,
+                        g.name,
+                        {
+                            "kmin": s.kmin,
+                            "kmax": s.kmax,
+                            "rmin": s.rmin,
+                            "rmax": s.rmax,
+                        },
+                        None,
+                        g.id,
+                    )
+                )
+        self.tbl_joint.setRowCount(0)
+        for tag, name, settings, rfac, gid in rows:
+            r = self.tbl_joint.rowCount()
+            self.tbl_joint.insertRow(r)
+
+            def _num(key, default=float("nan")):
+                try:
+                    return float(settings.get(key, default))
+                except (TypeError, ValueError):
+                    return float("nan")
+
+            tag_item = QTableWidgetItem(str(tag))
+            tag_item.setToolTip(str(name))
+            tag_item.setData(Qt.ItemDataRole.UserRole, gid)
+            self.tbl_joint.setItem(r, 0, tag_item)
+            self.tbl_joint.setItem(
+                r, 1, QTableWidgetItem(f"{_num('kmin'):.2f}–{_num('kmax'):.2f}")
+            )
+            self.tbl_joint.setItem(
+                r, 2, QTableWidgetItem(f"{_num('rmin'):.2f}–{_num('rmax'):.2f}")
+            )
+            if isinstance(rfac, (int, float)) and np.isfinite(float(rfac)):
+                r_item = QTableWidgetItem(f"{float(rfac):.4f}")
+            else:
+                r_item = QTableWidgetItem("—")
+            self.tbl_joint.setItem(r, 3, r_item)
+        self.tbl_joint.clearSelection()
+
+    def _joint_row_clicked(self, row: int, _col: int) -> None:
+        self.tbl_joint.clearSelection()
+        item = self.tbl_joint.item(row, 0)
+        gid = str(item.data(Qt.ItemDataRole.UserRole) or "") if item else ""
+        if gid and any(g.id == gid for g in self.project.groups):
+            self._select_group_in_list(gid)
+
+    def _joint_view_for(self, g) -> Optional[FitResult]:
+        """The joint result's own curves for group *g* — None when stale."""
+        result = getattr(self, "last_joint_fit", None)
+        if not isinstance(result, FitResult) or not result.ok:
+            return None
+        objs = getattr(self, "_joint_group_objs", {}) or {}
+        if g is None or g.id not in objs:
+            return None
+        try:
+            if g.session is None or g.session.group is not objs[g.id]:
+                return None
+        except Exception:
+            return None
+        rows = list(result.datasets or [])
+        ids = list(getattr(self, "_joint_group_ids", []) or [])
+        if len(ids) == len(rows) and g.id in ids:
+            rows = [rows[ids.index(g.id)]]  # by position: names need not be unique
+        else:
+            rows = [r for r in rows if str(r.get("name", "")) == str(g.name)]
+        for row in rows:
+            view = FitResult(
+                ok=True,
+                message="joint fit view",
+                params=dict(result.params or {}),
+                statistics=dict(result.statistics or {}),
+                paths=list(row.get("paths") or []),
+                correlations=list(result.correlations or []),
+                report_text=str(result.report_text or ""),
+                plot_views=dict(row.get("plot_views") or {}),
+                joint=True,
+                datasets=list(result.datasets or []),
+            )
+            stats = dict(view.statistics)
+            stats["dataset_r_factor"] = row.get("r_factor")
+            stats["dataset_tag"] = row.get("tag")
+            stats["dataset_name"] = row.get("name")
+            view.statistics = stats
+            return view
+        return None
+
+    def _run_joint_fit(self) -> None:
+        if self._worker_is_running():
+            return
+        self._worker_busy = False
+        self._set_left_mode("fit")
+        targets = self._joint_fit_set()
+        if len(targets) < 2:
+            QMessageBox.information(
+                self, self.i18n.t("box_joint_fit"), self.i18n.t("joint_need_two")
+            )
+            return
+        cur = self.project.current
+        if cur is not None:
+            try:
+                cur.settings = self._settings_from_controls()
+            except Exception:
+                pass
+        gds = self._gds_from_table()
+        paths = self._paths_from_table()
+        if not gds:
+            QMessageBox.information(
+                self, self.i18n.t("box_joint_fit"), self.i18n.t("no_usable_paths")
+            )
+            return
+        prepared = []
+        for g in targets:
+            if g.session is None or g.session.group is None:
+                if g.settings is None:
+                    g.settings = self._settings_from_controls()
+                res = g.process()
+                if not res.ok:
+                    QMessageBox.information(
+                        self,
+                        self.i18n.t("box_joint_fit"),
+                        self.i18n.t(
+                            "joint_process_failed", name=g.name, msg=str(res.message)[:300]
+                        ),
+                    )
+                    return
+            used, _kind = self._paths_for_group(g, paths)
+            if not used:
+                QMessageBox.information(
+                    self,
+                    self.i18n.t("box_joint_fit"),
+                    self.i18n.t("joint_no_paths", name=g.name),
+                )
+                return
+            prepared.append((g, used))
+        taken: list = []
+        datasets = []
+        for g, used in prepared:
+            tag = dataset_tag(g.name, taken)
+            taken.append(tag)
+            datasets.append(
+                FitDataset(
+                    name=g.name,
+                    tag=tag,
+                    group=g.session.snapshot_group_for_fit(),
+                    settings=self._fit_settings_from_athena(g.settings),
+                    paths=used,
+                )
+            )
+        self._log(self._bi("联合拟合：", "Joint fit:"))
+        for ds in datasets:
+            self._log(
+                f"  {ds.name} -> tag {ds.tag}; paths: "
+                + ", ".join(p.label for p in ds.paths)
+                + f"; k {ds.settings.kmin:g}-{ds.settings.kmax:g}"
+                + f" R {ds.settings.rmin:g}-{ds.settings.rmax:g}"
+            )
+        base_settings = datasets[0].settings
+        data_desc = f"joint({len(datasets)}): " + " + ".join(ds.name for ds in datasets)
+        # the groups as fitted; installed with the result (not now), so a
+        # member reprocessed while this fit runs never borrows the old result
+        group_objs = {g.id: g.session.group for g, _used in prepared}
+        group_ids = [g.id for g, _used in prepared]
+
+        def job():
+            return run_feffit_multi(datasets, gds)
+
+        def _done(result):
+            self.worker = None
+            if isinstance(result, FitResult) and result.ok:
+                self._joint_group_objs = group_objs
+                self._joint_group_ids = group_ids
+            # the snapshot keeps the table as it was (every row once, unticked
+            # rows too), not the per-dataset path lists concatenated
+            self._joint_fit_done(result, gds, paths, base_settings, data_desc, prepared)
+
+        def _failed(tb: str):
+            self.worker = None
+            self.last_joint_fit = None
+            self._fit_failed(tb)
+
+        self._set_fit_result_text(self._bi("联合拟合运行中…", "Running joint fit…"))
+        self._worker_busy = True
+        worker = Worker(job, self)
+        self.worker = worker
+        worker.finished_ok.connect(_done)
+        worker.failed.connect(_failed)
+        worker.finished.connect(lambda: self._retire_worker(worker))
+        worker.start()
+
+    def _joint_fit_done(self, result, gds, paths, settings, data_desc, prepared) -> None:
+        self._worker_busy = False
+        if not isinstance(result, FitResult) or not result.ok:
+            self.last_joint_fit = None
+            self._fit_failed(
+                result.message if isinstance(result, FitResult) else "joint fit failed"
+            )
+            return
+        self.last_joint_fit = result
+        # audit against the {ds}-expanded rows so per-dataset bounds are seen
+        self._audit_result(result, list(getattr(result, "gds_used", None) or gds), "generic")
+        self._fit_done(result)
+        self._refresh_joint_table(result)
+        try:
+            parts = []
+            for row in result.datasets or []:
+                rf = row.get("r_factor")
+                if isinstance(rf, (int, float)) and np.isfinite(float(rf)):
+                    parts.append(f"{row.get('tag')}={float(rf):.4f}")
+                else:
+                    parts.append(f"{row.get('tag')}=?")
+            self._log("joint R-factors (per dataset): " + ", ".join(parts))
+        except Exception:
+            pass
+        try:
+            save_fit_to_history(
+                result,
+                gds,
+                paths,
+                settings,
+                data_desc=data_desc,
+                history_dir=self._history_cache_dir(),
+                structure_models=feff_build.structure_models_for(
+                    [p for _g, used in prepared for p in used]
+                ),
+            )
+            self._refresh_fit_history()
+        except Exception as exc:
+            self._log(f"history save failed: {exc}")
+        ids = [g.id for g, _used in prepared]
+        cur = self.project.current
+        target = cur.id if (cur is not None and cur.id in ids) else (ids[0] if ids else None)
+        if target:
+            self._select_group_in_list(target, replot=False)
+        self.last_fit = self._joint_view_for(self.project.current) or result
+        self._replot()
+        self._refresh_fit_panel()
+
+    def _last_search_steps(self, result) -> list:
+        search = getattr(self, "_last_search", None)
+        if search is None or getattr(search, "final_result", None) is not result:
+            return []
+        try:
+            return list(search.to_dict().get("steps") or [])
+        except Exception:
+            return []
+
+    def _last_search_limits(self, result) -> dict:
+        search = getattr(self, "_last_search", None)
+        if search is None or getattr(search, "final_result", None) is not result:
+            return {}
+        return dict(getattr(search, "upper_limits", {}) or {})
+
+    def _last_search_notes(self, result) -> str:
+        search = getattr(self, "_last_search", None)
+        if search is None or getattr(search, "final_result", None) is not result:
+            return ""
+        return str(getattr(search, "user_notes", "") or "")[:500]
+
+    def _joint_review_context(self, result: FitResult) -> dict:
+        """AI evidence for one joint fit: every dataset, windows and assignment."""
+        base = self._fit_review_context(self.last_fit or result)
+        rows = []
+        tags = []
+        for row in result.datasets or []:
+            tag = str(row.get("tag", ""))
+            tags.append(tag)
+            rows.append(
+                {
+                    "name": str(row.get("name", "")),
+                    "tag": tag,
+                    "settings": dict(row.get("settings") or {}),
+                    "r_factor": row.get("r_factor"),
+                    "n_idp": row.get("n_idp"),
+                    "statistics": dict(result.statistics or {}),
+                    "paths": [
+                        {
+                            "label": p.get("label"),
+                            "reff": p.get("reff"),
+                            "s02": p.get("s02"),
+                            "deltar": p.get("deltar"),
+                            "sigma2": p.get("sigma2"),
+                        }
+                        for p in (row.get("paths") or [])
+                    ],
+                }
+            )
+        shared, independent = [], []
+        for name in sorted((result.params or {}).keys()):
+            if any(tag and name.endswith("_" + tag) for tag in tags):
+                independent.append(name)
+            else:
+                shared.append(name)
+        base.update(
+            {
+                "joint": True,
+                "datasets": rows,
+                "dataset_count": len(rows),
+                "shared_parameters": shared,
+                "independent_parameters": independent,
+            }
+        )
+        return base
+
+    def _joint_patch_is_copy(self, name: str) -> bool:
+        """A GDS patch aimed at a {ds}-expanded copy rather than the template."""
+        result = getattr(self, "last_joint_fit", None)
+        if not isinstance(result, FitResult) or not result.datasets:
+            return False
+        rows = {
+            str(p.name).strip()
+            for p in self._gds_from_table()
+            if str(p.name).strip()
+        }
+        if name in rows:
+            return False
+        for row in result.datasets:
+            tag = str(row.get("tag") or "")
+            if tag and name.endswith("_" + tag):
+                base = name[: -(len(tag) + 1)]
+                if base in rows or (base + "_{ds}") in rows:
+                    return True
+        return False
+
+    # ========== Auto model (v4.9.0) ==========
+    def _auto_model_entries(self) -> list:
+        """Marked structures whose absorber is the current group's element."""
+        cur = self.project.current
+        element = str(getattr(cur, "element", "") or "").strip().lower()
+        out = []
+        for entry in self._cif_marked_entries():
+            absorber = str(entry.absorber_as or entry.absorber or "").strip().lower()
+            if element and absorber == element:
+                out.append(entry)
+        return out
+
+    def _fit_ready_current(self):
+        """The current group, processed (Norm run on demand), or None."""
+        cur = self.project.current
+        if cur is None:
+            QMessageBox.information(self, self.i18n.t("box_cif"), self.i18n.t("no_current_group"))
+            return None
+        if cur.session is None or cur.session.group is None:
+            self._set_left_mode("norm")
+            self._apply_current()
+            self._set_left_mode("fit")
+        if cur.session is None or cur.session.group is None:
+            QMessageBox.information(self, self.i18n.t("box_cif"), self.i18n.t("fit_need_process"))
+            return None
+        return cur
+
+    def _auto_fit_from_structures(self, scope: str = "current") -> None:
+        """Auto fit's chain from the ticked structures (was Auto model, v4.9.0).
+
+        Phases mode + Max come from the Structures module. The model is built
+        and fitted on the current group, written to the tables (one undoable
+        step) and the tried models are listed; Marked / All then fit the
+        other groups with that model.
+        """
+        cur = self._fit_ready_current()
+        if cur is None:
+            return
+        mode = self._struct_mode()
+        entries = self._auto_model_entries()
+        if mode == "single":
+            if len(entries) != 1:
+                QMessageBox.information(
+                    self,
+                    self.i18n.t("box_cif"),
+                    self.i18n.t("auto_need_one", n=len(entries)),
+                )
+                return
+        else:
+            if not entries:
+                QMessageBox.information(
+                    self, self.i18n.t("box_cif"), self.i18n.t("qc_need_marked")
+                )
+                return
+            if len(entries) == 1:
+                answer = QMessageBox.question(
+                    self,
+                    self.i18n.t("box_cif"),
+                    self.i18n.t("auto_one_candidate"),
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+        self._cif_run_feff(entries=entries)
+        entries = [e for e in entries if e.runs]
+        if not entries:
+            return
+        has_ms = False
+        if mode == "single":
+            has_ms = any(
+                not p.single_scattering for p in self._cif_paths_for_entries([entries[0]])
+            )
+        dlg = AutoModelDialog(
+            self,
+            t=self.i18n.t,
+            bi=self._bi,
+            mode=mode,
+            candidates=[e.label for e in entries],
+            s02=self._cif_s02(),
+            has_ms=has_ms,
+            max_phases=self._max_phases(),
+            user_notes=str(self.store.value("structures/auto_notes", "") or ""),
+            tables_only=self.tbl_paths.rowCount() > 0,
+        )
+        accepted = dlg.exec() == QDialog.DialogCode.Accepted
+        if dlg.tables_only_chosen():
+            self._auto_fit_tables(scope)
+            return
+        if not accepted:
+            return
+        values = dlg.values()
+        self.store.setValue("structures/auto_notes", values["notes"])
+        search = self._run_auto_model_search(values, entries, cur)
+        if search is None:
+            return
+        applied = search.final_result is not None
+        if applied:
+            self._apply_search_result(search, cur, values)
+        summary = self._search_summary(search)
+        if applied:
+            summary = (summary + "  " if summary else "") + self.i18n.t("auto_applied_note")
+        dlg.show_result(self._search_rows(search), summary, applied=applied)
+        dlg.exec()
+        if applied and scope != "current":
+            self._auto_fit_tables(scope)
+
+    def _run_auto_model_search(self, values: dict, entries, group):
+        windows = self._build_fit_settings_from_ui()
+        snapshot = group.session.snapshot_group_for_fit()
+        mode = str(values.get("mode") or "single")
+
+        def fit_fn(gds, paths):
+            return self._run_with_busy(
+                lambda: run_feffit(snapshot, gds, paths, windows),
+                group.name,
+                self.i18n.t("auto_fit"),
+            )
+
+        def cancelled() -> bool:
+            dlg = getattr(self, "_load_progress", None)
+            try:
+                return bool(dlg is not None and dlg.wasCanceled())
+            except Exception:
+                return False
+
+        def progress(label: str, i: int, n: int) -> None:
+            self._progress_update(0, f"{label} ({i}/{n})")
+
+        self._progress_begin(
+            self.i18n.t("auto_fit"), sliding=True, window_title=self.i18n.t("box_cif")
+        )
+        try:
+            if mode == "single":
+                paths = self._cif_paths_for_entries([entries[0]])
+                search = single_phase_search(
+                    fit_fn,
+                    paths,
+                    float(values.get("s02", 0.9)),
+                    bool(values.get("s02_free")),
+                    bool(values.get("try_ms")),
+                    windows=windows,
+                )
+            else:
+                taken: list = []
+                candidates = []
+                for entry in entries:
+                    tag = feff_build.phase_tag(entry, taken)
+                    taken.append(tag)
+                    candidates.append(
+                        {
+                            "tag": tag,
+                            "label": entry.label,
+                            "formula": entry.formula,
+                            "paths": self._cif_paths_for_entries([entry]),
+                        }
+                    )
+                pinned = None
+                wanted = str(values.get("main") or "")
+                if wanted:
+                    for cand in candidates:
+                        if cand["label"] == wanted:
+                            pinned = cand["tag"]
+                build_fn = lambda phases: feff_build.phase_fraction_model(
+                    phases, float(values.get("s02", 0.9)), windows
+                )
+                search = stepwise_phases(
+                    fit_fn,
+                    build_fn,
+                    candidates,
+                    max_phases=int(values.get("max_phases", 2)),
+                    pinned=pinned,
+                    want_limits=bool(values.get("limits")),
+                    progress=progress,
+                    cancelled=cancelled,
+                )
+        except ValueError as exc:
+            code = str(exc)
+            self._progress_end()
+            key = "cif_model_ms" if code == "multiple-scattering" else "cif_model_budget_full"
+            nidp = feff_build.n_independent(windows)
+            try:
+                msg = self.i18n.t(key, nidp=nidp)
+            except Exception:
+                msg = code
+            QMessageBox.information(self, self.i18n.t("box_cif"), msg)
+            return None
+        finally:
+            if getattr(self, "_load_progress", None) is not None:
+                self._progress_end()
+        search.mode = mode
+        search.user_notes = str(values.get("notes") or "")[:500]
+        self._last_search = search
+        if search.final_result is not None:
+            self._audit_result(search.final_result, search.final_gds, mode)
+        for step in search.steps:
+            for row in step.get("tried") or []:
+                if row.get("accepted") and row.get("result") is not None:
+                    self._audit_result(row["result"], row.get("gds") or [], mode)
+        # plan §13.5.4: adopted steps + the final model reach the history as
+        # soon as the search ends (closing the result page must not lose them)
+        self._save_search_history(search, group, windows)
+        self._refresh_fit_history()
+        return search
+
+    def _search_rows(self, search) -> list:
+        t = self.i18n.t
+        rows = []
+        for step in search.steps:
+            for row in step.get("tried") or []:
+                level = str(row.get("audit_verdict") or "pass")
+                if row.get("error") == "budget":
+                    audit_text = t("auto_err_budget")
+                elif row.get("error"):
+                    audit_text = str(row["error"])[:80]
+                elif level == "fail":
+                    audit_text = t("auto_audit_fail")
+                elif level == "warn":
+                    audit_text = t("auto_audit_warn")
+                else:
+                    audit_text = t("auto_audit_pass")
+                if row.get("accepted"):
+                    result_text = t("auto_accepted")
+                elif row.get("ok"):
+                    result_text = t("auto_rejected")
+                else:
+                    result_text = "—"
+                rows.append(
+                    {
+                        "step": step.get("step", ""),
+                        "tag": row.get("tag", ""),
+                        "chi_square": row.get("chi_square"),
+                        "r_factor": row.get("r_factor"),
+                        "p": row.get("p"),
+                        "audit": audit_text,
+                        "audit_level": level,
+                        "result_text": result_text,
+                        "tooltip": " ".join(
+                            str(f) for f in (row.get("flags") or [])
+                        ),
+                    }
+                )
+        return rows
+
+    def _search_summary(self, search) -> str:
+        t = self.i18n.t
+        result = search.final_result
+        parts = []
+        if search.error == "budget":
+            # the model was refused before any fit — not an audit failure
+            nidp = feff_build.n_independent(self._build_fit_settings_from_ui())
+            parts.append(t("cif_model_budget_full", nidp=nidp))
+        elif search.error:
+            parts.append(t("auto_model_failed", msg=search.error))
+        elif search.all_failed:
+            parts.append(t("auto_all_failed"))
+        if search.cancelled:
+            parts.append(t("auto_cancelled"))
+        if result is not None:
+            fractions = []
+            for name, info in (result.params or {}).items():
+                if not str(name).startswith("x_"):
+                    continue
+                value = float((info or {}).get("value", float("nan")))
+                err = float((info or {}).get("stderr", float("nan")))
+                if value != value:
+                    continue
+                fractions.append(
+                    f"{name[2:]} {value:.2f}"
+                    + (f" ± {err:.2f}" if err == err else "")
+                )
+            if fractions:
+                parts.append(t("auto_summary", n=len(fractions), fractions=", ".join(fractions)))
+            if search.mode == "single":
+                ms_rows = [
+                    row
+                    for step in search.steps
+                    for row in (step.get("tried") or [])
+                    if str(row.get("tag")) == "MS"
+                ]
+                for row in ms_rows:
+                    p = row.get("p")
+                    if isinstance(p, (int, float)):
+                        key = "auto_ms_kept" if row.get("accepted") else "auto_ms_rejected"
+                        parts.append(t(key, p=float(p)))
+        notes = dict(getattr(search, "limit_notes", {}) or {})
+        for tag, limit in (search.upper_limits or {}).items():
+            if notes.get(tag) == "budget":
+                parts.append(t("auto_limit_budget", tag=tag))
+            elif notes.get(tag):
+                parts.append(t("auto_limit_failed", tag=tag))
+            elif limit is None:
+                parts.append(t("auto_limit_none", tag=tag))
+            else:
+                parts.append(t("auto_limit_line", tag=tag, x=float(limit)))
+        return "  ".join(p for p in parts if p)
+
+    def _save_search_history(self, search, group, windows) -> None:
+        saved = set()
+        for step in search.steps:
+            for row in step.get("tried") or []:
+                if not row.get("accepted") or row.get("result") is None:
+                    continue
+                key = id(row["result"])
+                if key in saved:
+                    continue
+                saved.add(key)
+                try:
+                    save_fit_to_history(
+                        row["result"],
+                        row.get("gds") or [],
+                        row.get("paths") or [],
+                        windows,
+                        data_desc=group.name,
+                        history_dir=self._history_cache_dir(),
+                        structure_models=feff_build.structure_models_for(row.get("paths") or []),
+                        fit_mode=search.mode,
+                        search=search.to_dict() if row["result"] is search.final_result else None,
+                    )
+                except Exception as exc:
+                    self._log(f"history save failed: {exc}")
+        if search.final_result is not None and id(search.final_result) not in saved:
+            try:
+                save_fit_to_history(
+                    search.final_result,
+                    search.final_gds,
+                    search.final_paths,
+                    windows,
+                    data_desc=group.name,
+                    history_dir=self._history_cache_dir(),
+                    structure_models=feff_build.structure_models_for(search.final_paths),
+                    fit_mode=search.mode,
+                    search=search.to_dict(),
+                )
+            except Exception as exc:
+                self._log(f"history save failed: {exc}")
+
+    def _apply_search_result(self, search, group, values: dict) -> None:
+        if search.final_result is None:
+            return
+        # history was saved when the search ended (_run_auto_model_search)
+        self._push_module_undo("auto_fit", [], fit_ui=self._snapshot_fit_ui())
+        self.tbl_gds.setRowCount(0)
+        for param in search.final_gds:
+            self._gds_add_row(param)
+        self.tbl_paths.setRowCount(0)
+        for pd in search.final_paths:
+            self._paths_add_row(pd)
+        self._log(
+            self._bi(
+                f"自动建模：{len(search.final_paths)} 条路径，模式 {search.mode}",
+                f"auto model: {len(search.final_paths)} paths, mode {search.mode}",
+            )
+        )
+        self._refresh_fit_panel()
+        self._fit_done(search.final_result)
+        self._refresh_fit_history()
 
     # ========== File IO ==========
     def _open_start_dir(self) -> str:
@@ -11668,6 +13824,7 @@ class MainWindow(QMainWindow):
         gds = self._gds_from_table()
         paths = self._paths_from_table()
         used, match_kind = self._paths_for_group(g, paths)
+        fit_all_accepted = False
         if match_kind == "mismatch":
             ans = QMessageBox.question(
                 self,
@@ -11683,6 +13840,7 @@ class MainWindow(QMainWindow):
                 self._log(self._bi("已取消拟合（元素/路径不匹配）", "Fit cancelled (element/path mismatch)"))
                 return
             used = [p for p in paths if p.use and p.feff_file]
+            fit_all_accepted = True
         elif match_kind == "fallback-untagged":
             self._log(
                 self._bi(
@@ -11704,7 +13862,12 @@ class MainWindow(QMainWindow):
             return
         gds = self._gds_from_table()
         paths = self._paths_from_table()
-        used = [p for p in paths if p.use and p.feff_file]
+        if fit_all_accepted:
+            used = [p for p in paths if p.use and p.feff_file]
+        else:
+            # v4.7.0: only the paths assigned to THIS group's element.  The old
+            # re-read took every ticked path, so a Ni fit also counted Fe paths.
+            used, _match_kind = self._paths_for_group(g, paths)
         fs = self._build_fit_settings_from_ui()
 
         self._log(self._bi(f"拟合 {g.name}（{len(used)} 条路径）…", f"Fitting {g.name} ({len(used)} paths)…"))
@@ -11714,16 +13877,19 @@ class MainWindow(QMainWindow):
         data_desc = g.name
 
         def job():
-            return run_feffit(group, gds, paths, fs)
+            return run_feffit(group, gds, used, fs)
 
         def _done(result):
             self.worker = None
+            if isinstance(result, FitResult) and result.ok:
+                self._audit_result(result, gds, "generic")
             self._fit_done(result)
             if isinstance(result, FitResult) and result.ok:
                 try:
                     save_fit_to_history(
-                        result, gds, paths, fs, data_desc=data_desc,
+                        result, gds, used, fs, data_desc=data_desc,
                         history_dir=self._history_cache_dir(),
+                        structure_models=feff_build.structure_models_for(used),
                     )
                     self._refresh_fit_history()
                 except Exception as exc:
@@ -11748,6 +13914,9 @@ class MainWindow(QMainWindow):
         self.lbl_fit_grade.setText(self._bi("拟合失败", "Fit failed"))
         self.lbl_fit_quality.setText("")
         self.lbl_fit_warning.setText("")
+        if hasattr(self, "lbl_fit_audit"):
+            self.lbl_fit_audit.setText("")
+            self.lbl_fit_audit.setToolTip("")
         self.fit_quality_card.setStyleSheet("QFrame { background:#fdecea; border:1px solid #c0392b; border-radius:5px; }")
         self._set_left_mode("fit")
 
@@ -11812,6 +13981,39 @@ class MainWindow(QMainWindow):
         )
         self.lbl_fit_grade.setStyleSheet(f"font-weight:700; font-size:11px; color:{color};")
         self.lbl_fit_grade.setText(f"{self._bi('拟合评价', 'Fit quality')}: {tag}")
+        # v4.9.0 audit line; the card border shows the worse of R grade and audit
+        audit_flags = []
+        if hasattr(self, "lbl_fit_audit"):
+            try:
+                audit_flags = [
+                    AuditFlag.from_dict(f) if isinstance(f, dict) else f
+                    for f in (getattr(result, "audit", None) or [])
+                ]
+            except Exception:
+                audit_flags = []
+            level = audit_verdict(audit_flags)
+            n_warn = sum(1 for f in audit_flags if f.level == "warn")
+            n_fail = sum(1 for f in audit_flags if f.level == "fail")
+            if level == "fail":
+                self.lbl_fit_audit.setText(self.i18n.t("audit_fail", f=n_fail, w=n_warn))
+                self.lbl_fit_audit.setStyleSheet("font-size:11px; color:#c0392b;")
+            elif level == "warn":
+                self.lbl_fit_audit.setText(self.i18n.t("audit_warn", w=n_warn))
+                self.lbl_fit_audit.setStyleSheet("font-size:11px; color:#8a5a00;")
+            else:
+                self.lbl_fit_audit.setText(self.i18n.t("audit_pass"))
+                self.lbl_fit_audit.setStyleSheet("font-size:11px; color:#1f8a45;")
+            self.lbl_fit_audit.setToolTip(self._audit_tooltip(audit_flags))
+            if level == "fail":
+                color = "#c0392b"
+                background = "#fdecea"
+                self.fit_quality_card.setStyleSheet(
+                    f"QFrame {{ background:{background}; border:1px solid {color}; border-radius:5px; }}"
+                )
+            elif level == "warn" and color == "#1f8a45":
+                self.fit_quality_card.setStyleSheet(
+                    "QFrame { background:#fff7df; border:1px solid #b07d10; border-radius:5px; }"
+                )
         self.lbl_fit_quality.setTextFormat(Qt.TextFormat.RichText)
         redchi = st.get("reduced_chi_square", st.get("redchi"))
         self.lbl_fit_quality.setText(
@@ -11919,6 +14121,38 @@ class MainWindow(QMainWindow):
             },
             "curve_samples": curve_samples,
             "fit_report_excerpt": str(snap.get("report_text", "") or "")[:6000],
+            "fit_mode": str(snap.get("fit_mode", "") or ""),
+            "audit": list(snap.get("audit") or []),
+            "phase_search": list((snap.get("search") or {}).get("steps") or []),
+            "upper_limits": dict((snap.get("search") or {}).get("upper_limits") or {}),
+            "user_notes": str((snap.get("search") or {}).get("user_notes") or "")[:500],
+            "structure_models": list(snap.get("structure_models") or []),
+            "available_paths": self._available_paths_evidence(
+                [
+                    str((p or {}).get("feff_file", ""))
+                    for p in (snap.get("path_results") or [])
+                    if (p or {}).get("feff_file")
+                ],
+                float((snap.get("settings") or {}).get("rmax", 4.0) or 4.0),
+            ),
+            "budget": {
+                "n_independent": (snap.get("statistics") or {}).get("n_independent"),
+                "n_varys": (snap.get("statistics") or {}).get("n_varys"),
+                "s02": [
+                    {
+                        "name": str(name),
+                        "value": (info or {}).get("value") if isinstance(info, dict) else None,
+                        "kind": (info or {}).get("kind", "") if isinstance(info, dict) else "",
+                    }
+                    for name, info in (snap.get("params") or {}).items()
+                    if str(name).startswith("s02")
+                ],
+            },
+            "model_comparisons": [
+                c
+                for c in (self._model_comparisons or [])
+                if c.get("data") == str(snap.get("data", ""))
+            ],
         }
 
     def _ai_suggestion_contexts(self, scope: Optional[str] = None) -> tuple[str, list[dict]]:
@@ -11926,6 +14160,12 @@ class MainWindow(QMainWindow):
         scope = str(scope or self._ai_check_scope())
         if scope == "current":
             if isinstance(self.last_fit, FitResult) and self.last_fit.ok:
+                joint = getattr(self.last_fit, "joint", False)
+                full = getattr(self, "last_joint_fit", None)
+                if joint and isinstance(full, FitResult) and full.ok:
+                    # The current group is one member of a joint fit: the AI
+                    # needs every dataset, not just this group's slice.
+                    return scope, [self._joint_review_context(full)]
                 return scope, [self._fit_review_context(self.last_fit)]
             return scope, []
         marked_names = {group.name for group in self._marked_groups_for_scope()} if scope == "marked" else set()
@@ -12254,6 +14494,15 @@ class MainWindow(QMainWindow):
             },
             "curve_samples": curve_samples,
             "fit_report_excerpt": str(result.to_text() or "")[:6000],
+            # v4.9.0: chosen fitting mode, parameter audit, phase search
+            "fit_mode": str(getattr(result, "fit_mode", "") or ""),
+            "max_phases": self._max_phases(),
+            "audit": list(getattr(result, "audit", None) or []),
+            "phase_search": self._last_search_steps(result),
+            "upper_limits": self._last_search_limits(result),
+            "user_notes": self._last_search_notes(result),
+            # v4.7.0: where the paths came from + what the model left out
+            **self._structure_evidence(result),
         }
 
     def _fit_export_dir(self) -> Path:
@@ -12283,6 +14532,20 @@ class MainWindow(QMainWindow):
         written.append(report_path)
 
         kw = int(self.sp_kw_plot.value()) if hasattr(self, "sp_kw_plot") else 2
+        if getattr(res, "joint", False) and getattr(res, "datasets", None):
+            # Joint fit: one report + one k/R pair per dataset + the summary.
+            try:
+                written.extend(self._export_joint_datasets(res, out_dir, ts, kw))
+            except Exception as exc:
+                self._log(f"joint export partial fail: {exc}")
+            names = chr(10).join(str(q) for q in written)
+            self._log(self._bi(f"已导出联合拟合结果：{names}", f"Exported joint fit results:{chr(10)}{names}"))
+            QMessageBox.information(
+                self,
+                self.i18n.t("fit_export_all"),
+                self._bi(f"已导出：{names}", f"Exported:{chr(10)}{names}"),
+            )
+            return
         view = res.plot_views.get(kw) if getattr(res, "plot_views", None) else None
         try:
             if view:
@@ -12351,6 +14614,77 @@ class MainWindow(QMainWindow):
             self.i18n.t("fit_export_all"),
             self._bi(f"已导出：\n{names}", f"Exported:\n{names}"),
         )
+
+    def _export_joint_datasets(self, res, out_dir: Path, ts: str, kw: int) -> List[Path]:
+        """Per-dataset k/R CSVs plus the dataset summary table (v4.8.0)."""
+        written: List[Path] = []
+        for row in res.datasets or []:
+            tag = _safe_filename(str(row.get("tag") or "ds")) or "ds"
+            views = row.get("plot_views") or {}
+            view = views.get(kw) or views.get(str(kw)) or (next(iter(views.values())) if views else None)
+            if not view:
+                continue
+            kd = np.asarray(view["k"], dtype=float)
+            p = out_dir / f"fit_k_{tag}_{ts}.csv"
+            np.savetxt(
+                p,
+                np.column_stack([kd, view["data_kchi"], view["fit_kchi"]]),
+                delimiter=",",
+                header=f"k,data_k{kw}chi,fit_k{kw}chi",
+                comments="# ",
+            )
+            written.append(p)
+            resid = view.get("residual_rre")
+            cols = [view["r"], view["data_rmag"], view["fit_rmag"]]
+            header = "R,data_chir_mag,fit_chir_mag"
+            if resid is not None:
+                cols.append(resid)
+                header += ",residual_Re_chir"
+            p = out_dir / f"fit_R_{tag}_{ts}.csv"
+            np.savetxt(
+                p,
+                np.column_stack(cols),
+                delimiter=",",
+                header=header,
+                comments="# ",
+            )
+            written.append(p)
+        summary = out_dir / f"fit_datasets_{ts}.csv"
+        lines = ["name,tag,kmin,kmax,rmin,rmax,r_factor,n_idp"]
+        for row in res.datasets or []:
+            s = row.get("settings") or {}
+
+            def _f(key, fmt="{:.4f}"):
+                try:
+                    return fmt.format(float(s.get(key)))
+                except (TypeError, ValueError):
+                    return ""
+
+            try:
+                rf = f"{float(row.get('r_factor')):.6f}"
+            except (TypeError, ValueError):
+                rf = ""
+            try:
+                nidp = f"{float(row.get('n_idp')):.3f}"
+            except (TypeError, ValueError):
+                nidp = ""
+            lines.append(
+                ",".join(
+                    [
+                        '"' + str(row.get("name", "")).replace('"', "'") + '"',
+                        str(row.get("tag", "")),
+                        _f("kmin"),
+                        _f("kmax"),
+                        _f("rmin"),
+                        _f("rmax"),
+                        rf,
+                        nidp,
+                    ]
+                )
+            )
+        summary.write_text(chr(10).join(lines) + chr(10), encoding="utf-8")
+        written.append(summary)
+        return written
 
     def _export_fit_report(self):
         """Back-compat → combined export."""
@@ -14047,6 +16381,272 @@ class MainWindow(QMainWindow):
                 status_rows, btn_verify_ai, lbl_order, on_done=_refresh_models
             )
         )
+
+        # --- Databases (v4.11.0): same shape as the blocks above — one grey
+        # hint on top (all four explanations together), then one compact row
+        # per item: structure library -> offline CIF library -> CCDC -> AMCSD.
+        # Status lines (offline index, CCDC verify) sit under the grid and
+        # only show when they have something to say.
+        box_db = QGroupBox(self.i18n.t("settings_db_block"))
+        db_lay = QVBoxLayout(box_db)
+        db_hint = QLabel(
+            "\n".join(
+                f"{self.i18n.t(title)}：{self.i18n.t(help_key)}"
+                if self.i18n.lang == "zh"
+                else f"{self.i18n.t(title)}: {self.i18n.t(help_key)}"
+                for title, help_key in (
+                    ("db_struct_lib", "db_struct_lib_help"),
+                    ("db_offline", "db_offline_help"),
+                    ("ccdc_python", "db_ccdc_help"),
+                    ("db_amcsd", "db_amcsd_help"),
+                )
+            )
+        )
+        db_hint.setWordWrap(True)
+        db_hint.setStyleSheet(f"color:{hint_ink}; font-size:11px;")
+        db_lay.addWidget(db_hint)
+        db_grid = QGridLayout()
+        db_grid.setHorizontalSpacing(6)
+        db_grid.setColumnStretch(1, 1)
+        db_lay.addLayout(db_grid)
+        db_rows = [0]
+
+        def _db_item(title_key: str, field, buttons=()) -> None:
+            """Title | field | natural-width buttons, left-aligned."""
+            r = db_rows[0]
+            lab = QLabel(self.i18n.t(title_key))
+            lab.setMinimumWidth(72)
+            db_grid.addWidget(lab, r, 0)
+            db_grid.addWidget(field, r, 1)
+            btn_host = QWidget()
+            btn_row = QHBoxLayout(btn_host)
+            btn_row.setContentsMargins(0, 0, 0, 0)
+            btn_row.setSpacing(4)
+            for btn in buttons:
+                btn_row.addWidget(btn)
+            btn_row.addStretch(1)
+            db_grid.addWidget(btn_host, r, 2)
+            db_rows[0] = r + 1
+
+        class _StateLabel(QLabel):
+            """'<item>: <state>' line, hidden while empty."""
+
+            def __init__(self, prefix: str):
+                super().__init__("")
+                self._prefix = prefix
+                self.setWordWrap(True)
+                self.setVisible(False)
+
+            def setText(self, text: str) -> None:  # noqa: N802 (Qt name)
+                text = str(text or "")
+                super().setText(f"{self._prefix}{text}" if text else "")
+                self.setVisible(bool(text))
+
+        _sep = "：" if self.i18n.lang == "zh" else ": "
+
+        def _db_state(title_key: str) -> QLabel:
+            lab = _StateLabel(f"{self.i18n.t(title_key)}{_sep}" if title_key else "")
+            db_lay.addWidget(lab)
+            return lab
+
+        # structure library (moved from the Fit page's 📂 button)
+        ed_lib = QLineEdit(str(self._cif_library()))
+        ed_lib.setReadOnly(True)
+        btn_lib_browse = QPushButton(self.i18n.t("ccdc_browse"))
+        btn_lib_browse.setObjectName("ghostBtn")
+        btn_lib_open = QPushButton(self.i18n.t("open_folder"))
+        btn_lib_open.setObjectName("ghostBtn")
+
+        def _browse_lib() -> None:
+            folder = self._choose_cif_folder()
+            if folder:
+                ed_lib.setText(folder)
+
+        def _open_lib() -> None:
+            d = self._cif_library()
+            d.mkdir(parents=True, exist_ok=True)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(d.resolve())))
+
+        btn_lib_browse.clicked.connect(lambda *_: _browse_lib())
+        btn_lib_open.clicked.connect(lambda *_: _open_lib())
+
+        has_full = feff_build.has_full_amcsd()
+        lbl_amcsd = QLabel(
+            self.i18n.t("db_amcsd_full") if has_full else self.i18n.t("db_amcsd_trim")
+        )
+        btn_full_db = QPushButton(self.i18n.t("cif_full_db"))
+        btn_full_db.setObjectName("ghostBtn")
+        btn_full_db.setToolTip(self.i18n.t("cif_full_db_tip"))
+        btn_full_db.setEnabled(not has_full)
+
+        def _download_full_db() -> None:
+            target = str(feff_build.full_amcsd_path())
+            answer = QMessageBox.question(
+                self,
+                self.i18n.t("settings_db_block"),
+                self.i18n.t("cif_full_db_confirm", path=target),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            try:
+                path = self._run_with_busy(
+                    lambda: feff_build.download_full_amcsd(timeout=60),
+                    "AMCSD",
+                    self.i18n.t("cif_full_db"),
+                )
+            except Exception as exc:
+                QMessageBox.warning(self, self.i18n.t("settings_db_block"), str(exc)[:600])
+                return
+            lbl_amcsd.setText(self.i18n.t("cif_full_db_done", path=str(path)))
+            btn_full_db.setEnabled(False)
+
+        btn_full_db.clicked.connect(lambda *_: _download_full_db())
+
+        ed_ccdc_py = QLineEdit(str(self.store.value("ccdc/python", "") or ""))
+        ed_ccdc_py.setToolTip(self.i18n.t("ccdc_python_tip"))
+        btn_ccdc_browse = QPushButton(self.i18n.t("ccdc_browse"))
+        btn_ccdc_browse.setObjectName("ghostBtn")
+        btn_ccdc_find = QPushButton(self.i18n.t("ccdc_find"))
+        btn_ccdc_find.setObjectName("ghostBtn")
+        btn_ccdc_verify = QPushButton(self.i18n.t("ccdc_verify"))
+        btn_ccdc_verify.setObjectName("ghostBtn")
+        lbl_ccdc_state = QLabel("")  # placed in the grid below
+        lbl_ccdc_state.setWordWrap(True)
+        record = self._ccdc_record()
+        if record:
+            if record.get("ok"):
+                lbl_ccdc_state.setText(
+                    self.i18n.t(
+                        "ccdc_ok",
+                        ver=record.get("version") or "?",
+                        n=record.get("n_entries") if record.get("n_entries") is not None else "?",
+                    )
+                )
+            else:
+                lbl_ccdc_state.setText(
+                    self._ccdc_fail_text(
+                        str(record.get("kind") or "other"), str(record.get("message", ""))
+                    )
+                )
+
+        # v4.11.0: offline CIF library (a zip of CIFs, a folder, or a CSD pack)
+        ed_off = QLineEdit(str(self.store.value("structures/offline_lib", "") or ""))
+        ed_off.setToolTip(self.i18n.t("db_offline_tip"))
+        btn_off_zip = QPushButton(self.i18n.t("db_offline_zip"))
+        btn_off_zip.setObjectName("ghostBtn")
+        btn_off_dir = QPushButton(self.i18n.t("db_offline_dir"))
+        btn_off_dir.setObjectName("ghostBtn")
+        btn_off_index = QPushButton(self.i18n.t("db_offline_reindex"))
+        btn_off_index.setObjectName("ghostBtn")
+
+        # grid order: structure library, offline library, CCDC, AMCSD
+        _db_item("db_struct_lib", ed_lib, (btn_lib_browse, btn_lib_open))
+        _db_item("db_offline", ed_off, (btn_off_zip, btn_off_dir, btn_off_index))
+        _db_item("ccdc_python", ed_ccdc_py, (btn_ccdc_browse, btn_ccdc_find, btn_ccdc_verify))
+        _db_item("db_amcsd", lbl_amcsd, (btn_full_db,))
+        lbl_off_state = _db_state("")  # its texts already name the library
+        _ccdc_state = _db_state("ccdc_python")
+        _ccdc_state.setText(lbl_ccdc_state.text())
+        lbl_ccdc_state.deleteLater()
+        lbl_ccdc_state = _ccdc_state
+
+        def _offline_state(path: str) -> str:
+            from . import cif_library
+
+            if not path:
+                return ""  # the empty field already says "not set"
+            return self.i18n.t("db_offline_pack" if cif_library.csd_pack(path) else "db_offline_set")
+
+        def _set_offline(path: str) -> None:
+            ed_off.setText(path)
+            self.store.setValue("structures/offline_lib", path)
+            lbl_off_state.setText(_offline_state(path))
+
+        def _browse_offline_zip() -> None:
+            start = str(Path(ed_off.text().strip() or Path.home()).parent)
+            path, _filter = QFileDialog.getOpenFileName(
+                self,
+                self.i18n.t("db_offline"),
+                start,
+                "CIF archive (*.zip);;All files (*.*)",
+                options=QFileDialog.Option.DontUseNativeDialog,
+            )
+            if path:
+                _set_offline(path)
+
+        def _browse_offline_dir() -> None:
+            folder = _pick_directory(self, self.i18n.t("db_offline"), ed_off.text().strip() or str(Path.home()))
+            if folder:
+                _set_offline(folder)
+
+        def _reindex_offline() -> None:
+            from . import cif_library
+
+            path = ed_off.text().strip()
+            if not path or not Path(path).exists():
+                QMessageBox.information(self, self.i18n.t("settings_db_block"), self.i18n.t("cifsrc_no_offline"))
+                return
+            _set_offline(path)
+            try:
+                data = self._cif_busy(
+                    lambda: cif_library.load_or_build_index(
+                        path, self._cif_library() / "cif_index", cancel=self._busy_cancelled, rebuild=True
+                    ),
+                    Path(path).name,
+                    self.i18n.t("cifsrc_indexing"),
+                )
+            except cif_library.IndexCancelled:
+                return
+            except Exception as exc:
+                QMessageBox.warning(self, self.i18n.t("settings_db_block"), str(exc)[:600])
+                return
+            n = cif_library.index_count(data)
+            if data.get("kind") == "csd_pack":
+                lbl_off_state.setText(self.i18n.t("cifsrc_pack_ready", n=n))
+            else:
+                lbl_off_state.setText(self.i18n.t("cifsrc_index_done", n=n, bad=int(data.get("unreadable", 0))))
+            self._log(f"offline CIF library indexed: {n} CIFs ({path})")
+
+        btn_off_zip.clicked.connect(lambda *_: _browse_offline_zip())
+        btn_off_dir.clicked.connect(lambda *_: _browse_offline_dir())
+        btn_off_index.clicked.connect(lambda *_: _reindex_offline())
+        ed_off.editingFinished.connect(lambda: _set_offline(ed_off.text().strip()))
+        if ed_off.text().strip():
+            lbl_off_state.setText(_offline_state(ed_off.text().strip()))
+
+        def _browse_ccdc_python() -> None:
+            start = str(Path(ed_ccdc_py.text().strip() or Path.home()))
+            path, _filter = QFileDialog.getOpenFileName(
+                self,
+                self.i18n.t("ccdc_python"),
+                start,
+                "python.exe (python.exe);;All files (*.*)",
+                options=QFileDialog.Option.DontUseNativeDialog,
+            )
+            if path:
+                ed_ccdc_py.setText(path)
+
+        def _find_ccdc_python() -> None:
+            try:
+                found = self._cif_busy(
+                    ccdc_bridge.find_ccdc_pythons, "CCDC", self.i18n.t("ccdc_find")
+                )
+            except Exception:
+                found = []
+            if found:  # pythons that carry the ccdc package come first
+                ed_ccdc_py.setText(str(found[0]))
+                self._log(f"CCDC python candidates: {len(found)}")
+            else:  # keep whatever the user typed
+                self._log(self.i18n.t("ccdc_fail_notfound"))
+
+        btn_ccdc_browse.clicked.connect(lambda *_: _browse_ccdc_python())
+        btn_ccdc_find.clicked.connect(lambda *_: _find_ccdc_python())
+        btn_ccdc_verify.clicked.connect(
+            lambda *_: self._verify_ccdc(ed_ccdc_py, lbl_ccdc_state)
+        )
+        lay.addWidget(box_db)
 
         # --- About: plain button only (no outer group box) ---
         btn_about = QPushButton(self.i18n.t("about"))

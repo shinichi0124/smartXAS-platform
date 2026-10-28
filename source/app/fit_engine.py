@@ -30,8 +30,10 @@ DEFAULT_OUTPUT = APP_ROOT / "output"
 DEFAULT_FEFF_IN = DEFAULT_DATA / "feff_inputs"
 DEFAULT_FEFF_OUT = DEFAULT_DATA / "feff_paths"
 
-# FEFF runs write fixed-name files in shared folders — serialize across worker threads
-_FEFF_LOCK = threading.Lock()
+# FEFF runs write fixed-name files in shared folders — serialize across worker threads.
+# RLock: _prepare_model_a_paths holds it while run_feff (which takes the same
+# lock inside feff_build.run_feff6l) runs on the same thread.
+_FEFF_LOCK = threading.RLock()
 
 # Artemis Fit 92 Model A gold standard (from Fit92_ModelA_report.txt)
 GOLD_MODEL_A = {
@@ -109,9 +111,32 @@ class FitResult:
     # each requested plotting k-weight.  These are display-only: changing a
     # plot never alters the least-squares objective or re-fits parameters.
     plot_views: Dict[int, Dict[str, np.ndarray]] = field(default_factory=dict)
+    # v4.8.0 joint fits: one entry per dataset (name/tag/settings/r_factor/
+    # n_idp/paths/plot_views); joint is False for every single-dataset fit.
+    joint: bool = False
+    datasets: List[Dict[str, Any]] = field(default_factory=list)
+    # v4.9.0 parameter audit (fit_audit.AuditFlag dicts) and the model mode
+    audit: List[Dict[str, Any]] = field(default_factory=list)
+    fit_mode: str = ""
+    # acceptance fix 2026-10-27: the GDS rows actually fitted ({ds} expanded) — the audit needs
+    # their min/max; never saved, never shown
+    gds_used: List[Any] = field(default_factory=list)
 
     def to_text(self) -> str:
         lines = [self.report_text or "", ""]
+        if self.audit:
+            # v4.9.0: the parameter audit is part of every fit report.
+            lines.append("=== Parameter audit ===")
+            try:
+                from .fit_audit import AuditFlag, format_flags
+
+                flags = [
+                    AuditFlag.from_dict(f) if isinstance(f, dict) else f for f in self.audit
+                ]
+                lines.append(format_flags(flags))
+            except Exception:
+                lines.append(str(self.audit))
+            lines.append("")
         if self.validation:
             lines.append("=== Validation vs Artemis Fit 92 (Model A) ===")
             for k, v in self.validation.items():
@@ -529,24 +554,11 @@ def run_feff(
     dest_inp = work / "feff.inp"
     shutil.copy2(feff_inp, dest_inp)
 
-    # Prefer larch's bundled FEFF6l (Windows: larch/bin/win64/feff6l.exe)
-    ran = False
-    errors = []
-    try:
-        from larch.xafs import feff6l
+    # Bare subprocess (feff_build): larch's feff6l()/FeffRunner do a process-wide
+    # os.chdir and never close stdin (v4.7.0, evidence in feff_build).
+    from . import feff_build
 
-        feff6l(feffinp="feff.inp", folder=str(work), verbose=True)
-        ran = True
-    except Exception as e1:
-        errors.append(f"feff6l: {e1}")
-        try:
-            from larch.xafs import FeffRunner
-
-            runner = FeffRunner(feffinp="feff.inp", folder=str(work), verbose=True)
-            runner.run()
-            ran = True
-        except Exception as e2:
-            errors.append(f"FeffRunner: {e2}")
+    feff_build.run_feff6l(work)
 
     dats = sorted(work.glob("feff*.dat"))
     dats = [p for p in dats if p.name.lower().startswith("feff") and p.suffix.lower() == ".dat"]
@@ -555,11 +567,7 @@ def run_feff(
     if not dats:
         # list folder for debugging
         listing = "\n".join(f"  {p.name} ({p.stat().st_size})" for p in sorted(work.iterdir()))
-        raise RuntimeError(
-            "FEFF produced no feffNNNN.dat files.\n"
-            + "\n".join(errors)
-            + f"\nFolder listing:\n{listing}"
-        )
+        raise RuntimeError("FEFF produced no feffNNNN.dat files.\n" + f"Folder listing:\n{listing}")
     return dats
 
 
@@ -1199,13 +1207,16 @@ class PathDef:
     degen: Optional[float] = None
     # absorber-element tag for group↔path assignment ("" = untagged/wildcard)
     elem: str = ""
+    # v4.8.0: which dataset this path belongs to ("" = every group of that
+    # element); used by joint fits so one table can feed several datasets.
+    data: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @staticmethod
     def from_dict(d: dict) -> "PathDef":
-        return PathDef(**{k: d.get(k) for k in ("label", "feff_file", "use", "s02", "e0", "deltar", "sigma2", "third", "ei", "degen", "elem")})
+        return PathDef(**{k: d.get(k) for k in ("label", "feff_file", "use", "s02", "e0", "deltar", "sigma2", "third", "ei", "degen", "elem", "data")})
 
 
 def model_a_preset() -> Tuple[List[GDSParam], List[PathDef]]:
@@ -1229,264 +1240,537 @@ def model_a_preset() -> Tuple[List[GDSParam], List[PathDef]]:
     return gds, plist
 
 
+def dataset_tag(name: str, taken: Sequence[str] = ()) -> str:
+    """ASCII dataset tag for {ds}: letters/digits/underscore, <= 16 chars."""
+    import re as _re
+
+    base = _re.sub(r"[^A-Za-z0-9_]+", "_", str(name or ""))
+    base = _re.sub(r"_+", "_", base).strip("_")[:16]
+    if base and base[0].isdigit():
+        base = "d_" + base
+    if not base:
+        i = 1
+        while f"d{i}" in set(taken):
+            i += 1
+        base = f"d{i}"
+    tag = base
+    n = 2
+    while tag in set(taken):
+        suffix = f"_{n}"
+        tag = base[: max(1, 16 - len(suffix))] + suffix
+        n += 1
+    return tag
+
+
+def expand_ds(text: str, tag: str) -> str:
+    """Replace the {ds} token in one expression with this dataset's tag."""
+    return str(text or "").replace("{ds}", str(tag or ""))
+
+
+def _referenced_tags(datasets) -> set:
+    """Tags that actually use per-dataset parameters in a path expression."""
+    out = set()
+    for ds in datasets or []:
+        for p in ds.paths or []:
+            if any(
+                "{ds}" in str(getattr(p, f, "") or "")
+                for f in ("s02", "e0", "deltar", "sigma2")
+            ):
+                out.add(str(ds.tag))
+                break
+    return out
+
+
+def expand_gds(
+    gds: Sequence[GDSParam],
+    tags: Sequence[str],
+    referenced: Sequence[str] = (),
+) -> List[GDSParam]:
+    """Expand {ds} GDS rows into one row per referenced dataset tag.
+
+    A row whose NAME carries {ds} becomes one row per referenced tag (its
+    expression gets the same substitution; value/min/max are copied).  A row
+    whose EXPRESSION carries {ds} but whose name does not would silently be one
+    shared parameter, so it is refused.  Leftover braces and duplicate names are
+    refused too: they always mean a typo.
+    """
+    ref = [t for t in tags if t in set(referenced)] or list(tags)
+    out: List[GDSParam] = []
+    for g in gds:
+        name = str(g.name or "")
+        expr = str(g.expr or "")
+        if "{ds}" in name:
+            for tag in ref:
+                out.append(
+                    replace(
+                        g,
+                        name=name.replace("{ds}", tag),
+                        expr=expr.replace("{ds}", tag),
+                    )
+                )
+        elif "{ds}" in expr:
+            raise ValueError(
+                f"GDS row {name or '(unnamed)'} uses {{ds}} in its expression "
+                "but not in its name"
+            )
+        else:
+            out.append(g)
+    for row in out:
+        for field_name in ("name", "expr"):
+            text = str(getattr(row, field_name) or "")
+            if "{" in text or "}" in text:
+                raise ValueError(f"GDS {field_name} still contains braces: {text}")
+    names = [str(r.name).strip() for r in out if r.kind != "skip" and str(r.name).strip()]
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    if dupes:
+        raise ValueError("Duplicate GDS parameter names: " + ", ".join(dupes))
+    return out
+
+
+def _expr_names(text: str) -> set:
+    """Parameter names used in one larch expression."""
+    import ast as _ast
+    import re as _re
+
+    text = str(text or "").strip()
+    if not text:
+        return set()
+    try:
+        return {n.id for n in _ast.walk(_ast.parse(text, mode="eval")) if isinstance(n, _ast.Name)}
+    except SyntaxError:
+        return set(_re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text))
+
+
+def _prune_unused_ds_copies(
+    gds: Sequence[GDSParam], rows: Sequence[GDSParam], tags: Sequence[str], path_exprs: Sequence[str]
+) -> List[GDSParam]:
+    """Drop {ds} copies that no expanded path or GDS expression uses.
+
+    expand_gds makes one copy per dataset; a standard with fixed N that only
+    uses dr_{ds} would otherwise carry an unused n_std (larch freezes it, but it
+    still shows up in the report, the history and the AI evidence).
+    """
+    copies = {
+        str(g.name).replace("{ds}", t)
+        for g in gds
+        if "{ds}" in str(g.name or "")
+        for t in tags
+    }
+    used: set = set()
+    for text in path_exprs:
+        used |= _expr_names(text)
+    kept = [r for r in rows if str(r.name).strip() not in copies]
+    for r in kept:
+        used |= _expr_names(r.expr if r.kind == "expr" else "")
+    pending = [r for r in rows if str(r.name).strip() in copies]
+    while True:
+        new = [r for r in pending if str(r.name).strip() in used]
+        if not new:
+            break
+        for r in new:
+            pending.remove(r)
+            used |= _expr_names(r.expr if r.kind == "expr" else "")
+    dropped = {str(r.name).strip() for r in pending}
+    return [r for r in rows if str(r.name).strip() not in dropped]
+
+
+@dataclass
+class FitDataset:
+    """One dataset of a (possibly joint) fit: group + windows + its paths."""
+
+    name: str = ""
+    tag: str = ""
+    group: Any = None
+    settings: FitSettings = field(default_factory=FitSettings)
+    paths: List[PathDef] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "tag": self.tag,
+            "settings": asdict(self.settings),
+            "paths": [p.to_dict() for p in self.paths],
+        }
+
+
+def _active_gds(gds: Sequence[GDSParam]) -> List[GDSParam]:
+    return [g for g in gds if g.kind != "skip" and str(g.name).strip()]
+
+
+def _build_params(L, active: Sequence[GDSParam]):
+    pkw: Dict[str, Any] = {}
+    for g in active:
+        name = g.name.strip()
+        if g.kind == "expr" and g.expr.strip():
+            pkw[name] = L["param"](expr=g.expr.strip())
+        elif g.kind == "fix":
+            pkw[name] = L["param"](float(g.value), vary=False)
+        else:
+            vk: Dict[str, Any] = {}
+            if g.min is not None:
+                vk["min"] = float(g.min)
+            if g.max is not None:
+                vk["max"] = float(g.max)
+            pkw[name] = L["param"](float(g.value), vary=True, **vk)
+    return L["param_group"](**pkw)
+
+
+def _build_feffpaths(L, used: Sequence[PathDef]):
+    out = []
+    for pd in used:
+        if not Path(pd.feff_file).is_file():
+            raise FileNotFoundError(f"Missing FEFF path file: {pd.feff_file}")
+        fp_kw: Dict[str, Any] = {
+            "s02": pd.s02 or "1.0",
+            "e0": pd.e0 or "0.0",
+            "deltar": pd.deltar or "0.0",
+            "sigma2": pd.sigma2 or "0.0",
+        }
+        if pd.third:
+            fp_kw["third"] = pd.third
+        if pd.ei:
+            fp_kw["ei"] = pd.ei
+        if pd.degen is not None:
+            fp_kw["degen"] = float(pd.degen)
+        out.append((pd, L["feffpath"](pd.feff_file, **fp_kw)))
+    return out
+
+
+def _transform_for(L, settings: FitSettings):
+    return L["feffit_transform"](
+        kmin=settings.kmin,
+        kmax=settings.kmax,
+        dk=settings.dk,
+        kw=list(settings.kw_list),
+        window=settings.kwindow,
+        fitspace=settings.fit_space,
+        rmin=settings.rmin,
+        rmax=settings.rmax,
+        dr=settings.dr,
+        rwindow=settings.rwindow,
+    )
+
+
+def _param_value(out, name: str) -> Tuple[float, float]:
+    params_obj = getattr(out, "params", None)
+    if params_obj is None:
+        return float("nan"), float("nan")
+    try:
+        p = params_obj[name]
+    except Exception:
+        p = getattr(params_obj, name, None)
+    if p is None:
+        return float("nan"), float("nan")
+    try:
+        val = float(p.value)
+    except Exception:
+        try:
+            val = float(p)
+        except Exception:
+            return float("nan"), float("nan")
+    try:
+        err = float(p.stderr) if p.stderr is not None else float("nan")
+    except Exception:
+        err = float("nan")
+    return val, err
+
+
+def _extract_params(out, active: Sequence[GDSParam]) -> Dict[str, Any]:
+    params_out: Dict[str, Any] = {}
+    for g in active:
+        v, e = _param_value(out, g.name.strip())
+        params_out[g.name.strip()] = {"value": v, "stderr": e, "kind": g.kind, "expr": g.expr}
+    return params_out
+
+
+def _statistics(out, settings: FitSettings) -> Dict[str, Any]:
+    r_factor = float(getattr(out, "rfactor", getattr(out, "r_factor", float("nan"))))
+    chi2 = float(getattr(out, "chi_square", getattr(out, "chi2", float("nan"))))
+    redchi = float(getattr(out, "chi2_reduced", getattr(out, "redchi", float("nan"))))
+    n_ind = float(getattr(out, "n_independent", float("nan")))
+    if not np.isfinite(n_ind):
+        n_ind = 2.0 * (settings.kmax - settings.kmin) * (settings.rmax - settings.rmin) / np.pi + 2.0
+    if not np.isfinite(r_factor):
+        try:
+            r_factor = float(out.datasets[0].rfactor)
+        except Exception:
+            pass
+    return {
+        "r_factor": r_factor,
+        "chi_square": chi2,
+        "redchi": redchi,
+        "n_independent": n_ind,
+        "n_varys": int(getattr(out, "nvarys", 0) or 0),
+    }
+
+
+def _correlations(out) -> List[Tuple[str, str, float]]:
+    corrs: List[Tuple[str, str, float]] = []
+    try:
+        var_names = list(getattr(out, "var_names", []) or [])
+        for i, a in enumerate(var_names):
+            for b in var_names[i + 1:]:
+                try:
+                    c = out.params[a].correl.get(b)
+                    if c is not None and abs(c) >= 0.1:
+                        corrs.append((a, b, float(c)))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return sorted(corrs, key=lambda x: -abs(x[2]))
+
+
+def _path_infos(feff_paths, out, params_out: Dict[str, Any], dset) -> List[Dict[str, Any]]:
+    path_infos: List[Dict[str, Any]] = []
+    for pd, fp in feff_paths:
+        reff = float(getattr(fp, "reff", float("nan")))
+        fp.params = out.params
+        if getattr(fp, "dataset", None) is None:
+            fp.dataset = getattr(dset, "hashkey", None)
+        try:
+            drep = fp.dict_report()
+        except Exception:
+            drep = {}
+
+        def _fe(name: str):
+            try:
+                return float(drep.get(f"{name}_value"))
+            except Exception:
+                return None
+
+        dr_v, dr_e = (0.0, 0.0)
+        expr = (pd.deltar or "").strip()
+        if expr in params_out:
+            dr_v, dr_e = params_out[expr]["value"], params_out[expr]["stderr"]
+        deltar_v = _fe("deltar")
+        if deltar_v is not None:
+            r_v = reff + deltar_v if np.isfinite(reff) else float("nan")
+        else:
+            r_v = reff + dr_v if np.isfinite(reff) else float("nan")
+        path_infos.append(
+            {
+                "label": pd.label or Path(pd.feff_file).stem,
+                "feff_file": pd.feff_file,
+                "reff": reff,
+                "degen": float(getattr(fp, "degen", pd.degen or float("nan"))),
+                "s02": _fe("s02"),
+                "e0": _fe("e0"),
+                "deltar": deltar_v,
+                "sigma2": _fe("sigma2"),
+                "r": r_v,
+                "r_err": dr_e,
+                "exprs": {"s02": pd.s02, "e0": pd.e0, "deltar": pd.deltar, "sigma2": pd.sigma2},
+            }
+        )
+    return path_infos
+
+
+def _arr(obj, name):
+    v = getattr(obj, name, None)
+    if v is None:
+        return None
+    a = np.asarray(v, dtype=float)
+    return a.copy() if a.size else None
+
+
+def _dataset_views(dset, settings: FitSettings) -> Dict[int, Dict[str, np.ndarray]]:
+    data, model = dset.data, dset.model
+    fit_k = _arr(data, "k")
+    data_chi = _arr(data, "chi")
+    fit_chi = _arr(model, "chi")
+    if fit_k is None or data_chi is None or fit_chi is None:
+        return {}
+    try:
+        return build_fit_plot_views(fit_k, data_chi, fit_k, fit_chi, settings)
+    except Exception:
+        return {}
+
+
+def _dataset_rfactor(dset, params_obj, settings: FitSettings) -> Tuple[float, float]:
+    """Per-dataset R-factor and N_idp (joint fits report one R per dataset)."""
+    nidp = float(getattr(dset, "n_idp", float("nan")))
+    if not np.isfinite(nidp):
+        nidp = 2.0 * (settings.kmax - settings.kmin) * (settings.rmax - settings.rmin) / np.pi + 2.0
+    try:
+        resid = np.asarray(dset._residual(params_obj), dtype=float)
+        data = np.asarray(dset._residual(params_obj, data_only=True), dtype=float)
+        denom = float(np.sum(data ** 2))
+        if not np.isfinite(denom) or denom == 0.0:
+            return float("nan"), nidp
+        return float(np.sum(resid ** 2) / denom), nidp
+    except Exception:
+        return float("nan"), nidp
+
+
+def _apply_result_arrays(res: FitResult, out_dataset, settings: FitSettings) -> None:
+    data, model = out_dataset.data, out_dataset.model
+    fit_k = _arr(data, "k")
+    data_chi = _arr(data, "chi")
+    fit_chi = _arr(model, "chi")
+    fit_r = _arr(data, "r")
+    data_chir = _arr(data, "chir_mag")
+    fit_chir = _arr(model, "chir_mag")
+    resid_r = None
+    if data_chir is not None and fit_chir is not None and len(data_chir) == len(fit_chir):
+        resid_r = data_chir - fit_chir
+    res.k = fit_k
+    res.chi = data_chi
+    res.fit_k = fit_k if fit_chi is not None else None
+    res.fit_chi = fit_chi
+    res.r = fit_r
+    res.chir_mag = data_chir
+    res.fit_r = fit_r
+    res.fit_chir_mag = fit_chir
+    res.residual_r = resid_r
+    try:
+        res.plot_views = build_fit_plot_views(fit_k, data_chi, fit_k, fit_chi, settings)
+        preferred_weight = int(settings.kw_list[0]) if settings.kw_list else 2
+        view = res.plot_views.get(preferred_weight) or next(iter(res.plot_views.values()), None)
+        if view:
+            res.r = view["r"]
+            res.chir_mag = view["data_rmag"]
+            res.fit_r = view["r"]
+            res.fit_chir_mag = view["fit_rmag"]
+            res.residual_r = view["residual_rre"]
+    except Exception:
+        res.plot_views = {}
+
+
+def run_feffit_multi(datasets: Sequence["FitDataset"], gds: Sequence[GDSParam]) -> FitResult:
+    """Joint or single EXAFS fit over one or more datasets sharing one GDS table.
+
+    {ds} in GDS names and in path expressions expands to each dataset's tag, so
+    a model can share sigma^2 across samples while fitting one N per sample.
+    """
+    L = _require_larch()
+    dsets_in = list(datasets or [])
+    if not dsets_in:
+        raise ValueError("No datasets given")
+    taken: List[str] = []
+    for ds in dsets_in:
+        ds.settings = ds.settings or FitSettings()
+        ds.paths = [p for p in (ds.paths or []) if p.use and p.feff_file]
+        tag = str(ds.tag or "").strip()
+        if not tag or tag in taken:
+            tag = dataset_tag(tag or ds.name, taken)
+        ds.tag = tag
+        taken.append(tag)
+        if not ds.paths:
+            raise ValueError("No usable paths (need >=1 with use=True and a feff file)")
+        # larch keys a dataset's paths by a label derived from the feff file:
+        # two rows on one file would silently collapse into the last one.
+        seen: Dict[str, str] = {}
+        for p in ds.paths:
+            key = os.path.normcase(os.path.abspath(str(p.feff_file)))
+            if key in seen:
+                raise ValueError(
+                    f"{ds.name or ds.tag}: paths '{seen[key]}' and '{p.label}' use the same "
+                    f"feff file ({Path(p.feff_file).name}); larch would keep only one of them"
+                )
+            seen[key] = str(p.label or Path(p.feff_file).name)
+    active = _active_gds(gds)
+    if not active:
+        raise ValueError("No active GDS parameters")
+    tags = [ds.tag for ds in dsets_in]
+    rows = expand_gds(gds, tags, _referenced_tags(dsets_in))
+    path_exprs = [
+        expand_ds(getattr(p, f, ""), ds.tag)
+        for ds in dsets_in
+        for p in ds.paths
+        for f in ("s02", "e0", "deltar", "sigma2")
+    ]
+    rows = _prune_unused_ds_copies(gds, rows, tags, path_exprs)
+    active = _active_gds(rows)
+
+    try:
+        pars = _build_params(L, active)
+        prepared = []
+        for ds in dsets_in:
+            used = [
+                replace(
+                    p,
+                    s02=expand_ds(p.s02, ds.tag),
+                    e0=expand_ds(p.e0, ds.tag),
+                    deltar=expand_ds(p.deltar, ds.tag),
+                    sigma2=expand_ds(p.sigma2, ds.tag),
+                )
+                for p in ds.paths
+            ]
+            feff_paths = _build_feffpaths(L, used)
+            trans = _transform_for(L, ds.settings)
+            dset = L["feffit_dataset"](ds.group, [fp for _pd, fp in feff_paths], trans)
+            prepared.append((ds, dset, feff_paths))
+
+        out = L["feffit"](pars, [dset for _ds, dset, _fps in prepared])
+        report = L["feffit_report"](out)
+
+        params_out = _extract_params(out, active)
+        res = FitResult(ok=True, message="fit done")
+        res.params = params_out
+        res.statistics = _statistics(out, dsets_in[0].settings)
+        res.correlations = _correlations(out)
+        res.report_text = str(report)
+        res.joint = len(prepared) > 1
+        res.gds_used = list(active)
+
+        all_infos: List[Dict[str, Any]] = []
+        per_dataset: List[Dict[str, Any]] = []
+        for ds, dset, feff_paths in prepared:
+            infos = _path_infos(feff_paths, out, params_out, dset)
+            all_infos.extend(infos)
+            rfac, nidp = _dataset_rfactor(dset, out.params, ds.settings)
+            per_dataset.append(
+                {
+                    "name": ds.name,
+                    "tag": ds.tag,
+                    "settings": asdict(ds.settings),
+                    "r_factor": rfac,
+                    "n_idp": nidp,
+                    "paths": infos,
+                    "plot_views": _dataset_views(dset, ds.settings),
+                }
+            )
+        res.paths = all_infos
+        res.datasets = per_dataset
+        _apply_result_arrays(res, prepared[0][1], dsets_in[0].settings)
+
+        if res.joint:
+            lines = ["", "=== Per-dataset R-factor ==="]
+            for row in per_dataset:
+                head = f"  {row['name']!s:24s} tag {row['tag']:<10s}"
+                if np.isfinite(float(row["r_factor"])):
+                    lines.append(
+                        head
+                        + f" R = {float(row['r_factor']):.6f}"
+                        + f"  N_idp = {float(row['n_idp']):.1f}"
+                    )
+                else:
+                    lines.append(head + " per-dataset R-factor unavailable")
+            res.report_text = str(report) + chr(10).join(lines) + chr(10)
+        return res
+    except Exception as exc:
+        res = FitResult(ok=False, message=f"{exc}")
+        res.report_text = traceback.format_exc()
+        return res
+
+
 def run_feffit(
     group,
     gds: List[GDSParam],
     paths: List[PathDef],
     settings: Optional[FitSettings] = None,
 ) -> FitResult:
-    """Generic EXAFS fit: GDS parameter table + arbitrary path expressions.
+    """Single-dataset EXAFS fit (GDS table + arbitrary path expressions).
 
-    ``group`` must be an Athena-processed larch Group (needs chi(k)).
-    Parameter/path expressions may reference any GDS name (larch evaluates
-    them in the fit namespace, like Artemis mathexp).
+    A thin wrapper around run_feffit_multi so one model and many datasets run
+    through the same code.  The numbers are verified bit-identical to the 4.7.0
+    implementation against tmp/.../baseline_single_fit.json.
     """
-    L = _require_larch()
     settings = settings or FitSettings()
+    ds = FitDataset(name="", tag="", group=group, settings=settings, paths=list(paths))
+    return run_feffit_multi([ds], gds)
 
-    used = [p for p in paths if p.use and p.feff_file]
-    if not used:
-        raise ValueError("No usable paths (need ≥1 with use=True and a feff file)")
-    active = [g for g in gds if g.kind != "skip" and g.name.strip()]
-    if not active:
-        raise ValueError("No active GDS parameters")
-
-    try:
-        # --- parameters ---
-        pkw: Dict[str, Any] = {}
-        for g in active:
-            name = g.name.strip()
-            if g.kind == "expr" and g.expr.strip():
-                pkw[name] = L["param"](expr=g.expr.strip())
-            elif g.kind == "fix":
-                pkw[name] = L["param"](float(g.value), vary=False)
-            else:
-                vk: Dict[str, Any] = {}
-                if g.min is not None:
-                    vk["min"] = float(g.min)
-                if g.max is not None:
-                    vk["max"] = float(g.max)
-                pkw[name] = L["param"](float(g.value), vary=True, **vk)
-        pars = L["param_group"](**pkw)
-
-        # --- paths ---
-        feff_paths = []
-        for pd in used:
-            if not Path(pd.feff_file).is_file():
-                raise FileNotFoundError(f"Missing FEFF path file: {pd.feff_file}")
-            fp_kw: Dict[str, Any] = {
-                "s02": pd.s02 or "1.0",
-                "e0": pd.e0 or "0.0",
-                "deltar": pd.deltar or "0.0",
-                "sigma2": pd.sigma2 or "0.0",
-            }
-            if pd.third:
-                fp_kw["third"] = pd.third
-            if pd.ei:
-                fp_kw["ei"] = pd.ei
-            if pd.degen is not None:
-                fp_kw["degen"] = float(pd.degen)
-            feff_paths.append((pd, L["feffpath"](pd.feff_file, **fp_kw)))
-
-        trans = L["feffit_transform"](
-            kmin=settings.kmin,
-            kmax=settings.kmax,
-            dk=settings.dk,
-            kw=list(settings.kw_list),
-            window=settings.kwindow,
-            fitspace=settings.fit_space,
-            rmin=settings.rmin,
-            rmax=settings.rmax,
-            dr=settings.dr,
-            rwindow=settings.rwindow,
-        )
-        dset = L["feffit_dataset"](group, [fp for _, fp in feff_paths], trans)
-        out = L["feffit"](pars, dset)
-        report = L["feffit_report"](out)
-
-        # --- extract fitted params ---
-        def _pv(name: str) -> Tuple[float, float]:
-            params_obj = getattr(out, "params", None)
-            if params_obj is None:
-                return float("nan"), float("nan")
-            try:
-                p = params_obj[name]
-            except Exception:
-                p = getattr(params_obj, name, None)
-            if p is None:
-                return float("nan"), float("nan")
-            try:
-                val = float(p.value)
-            except Exception:
-                try:
-                    val = float(p)
-                except Exception:
-                    return float("nan"), float("nan")
-            try:
-                err = float(p.stderr) if p.stderr is not None else float("nan")
-            except Exception:
-                err = float("nan")
-            return val, err
-
-        params_out: Dict[str, Any] = {}
-        for g in active:
-            v, e = _pv(g.name.strip())
-            params_out[g.name.strip()] = {"value": v, "stderr": e, "kind": g.kind, "expr": g.expr}
-
-        # --- statistics ---
-        r_factor = float(getattr(out, "rfactor", getattr(out, "r_factor", float("nan"))))
-        chi2 = float(getattr(out, "chi_square", getattr(out, "chi2", float("nan"))))
-        redchi = float(getattr(out, "chi2_reduced", getattr(out, "redchi", float("nan"))))
-        n_ind = float(getattr(out, "n_independent", float("nan")))
-        if not np.isfinite(n_ind):
-            n_ind = 2.0 * (settings.kmax - settings.kmin) * (settings.rmax - settings.rmin) / np.pi + 2.0
-        if not np.isfinite(r_factor):
-            try:
-                r_factor = float(out.datasets[0].rfactor)
-            except Exception:
-                pass
-
-        # --- correlations ---
-        corrs: List[Tuple[str, str, float]] = []
-        try:
-            # lmfit Parameters has no `.correlations` — pairwise correl dicts
-            # live on each varying Parameter; names from feffit's var_names
-            var_names = list(getattr(out, "var_names", []) or [])
-            for i, a in enumerate(var_names):
-                for b in var_names[i + 1:]:
-                    try:
-                        c = out.params[a].correl.get(b)
-                        if c is not None and abs(c) >= 0.1:
-                            corrs.append((a, b, float(c)))
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-        # --- per-path evaluated values ---
-        path_infos: List[Dict[str, Any]] = []
-        for pd, fp in feff_paths:
-            reff = float(getattr(fp, "reff", float("nan")))
-            # evaluate path expressions against the fitted params — after the
-            # fit fp.s02 etc. are still raw expr strings, so use larch's own
-            # dict_report() (needs fp.params pointing at the result params)
-            fp.params = out.params
-            if getattr(fp, "dataset", None) is None:
-                # feffit fits dataset-internal path copies, so our fp.dataset
-                # stays None; path param names embed the dataset hashkey
-                # (feffdat.pathpar_name) — mirror it or dict_report KeyErrors
-                fp.dataset = getattr(dset, "hashkey", None)
-            try:
-                drep = fp.dict_report()
-            except Exception:
-                drep = {}
-
-            def _fe(name: str):
-                # dict_report "<name>_value" is the gformat string of the
-                # *evaluated* expression; None when unavailable
-                try:
-                    return float(drep.get(f"{name}_value"))
-                except Exception:
-                    return None
-
-            dr_v, dr_e = (0.0, 0.0)
-            # map deltar expression → GDS param stderr when it is a bare name
-            expr = (pd.deltar or "").strip()
-            if expr in params_out:
-                dr_v, dr_e = params_out[expr]["value"], params_out[expr]["stderr"]
-            deltar_v = _fe("deltar")
-            if deltar_v is not None:
-                # evaluated deltar (works for any expr, not just bare names)
-                r_v = reff + deltar_v if np.isfinite(reff) else float("nan")
-            else:
-                # fallback: only correct when deltar is a bare GDS param name
-                r_v = reff + dr_v if np.isfinite(reff) else float("nan")
-            path_infos.append(
-                {
-                    "label": pd.label or Path(pd.feff_file).stem,
-                    "feff_file": pd.feff_file,
-                    "reff": reff,
-                    "degen": float(getattr(fp, "degen", pd.degen or float("nan"))),
-                    "s02": _fe("s02"),
-                    "e0": _fe("e0"),
-                    "deltar": deltar_v,
-                    "sigma2": _fe("sigma2"),
-                    "r": r_v,
-                    "r_err": dr_e,
-                    "exprs": {"s02": pd.s02, "e0": pd.e0, "deltar": pd.deltar, "sigma2": pd.sigma2},
-                }
-            )
-
-        # --- arrays for plotting (data vs model in k and R) ---
-        def _arr(obj, name):
-            v = getattr(obj, name, None)
-            if v is None:
-                return None
-            a = np.asarray(v, dtype=float)
-            return a.copy() if a.size else None
-
-        ds0 = out.datasets[0]
-        data, model = ds0.data, ds0.model
-        fit_k = _arr(data, "k")
-        data_chi = _arr(data, "chi")
-        fit_chi = _arr(model, "chi")
-        fit_r = _arr(data, "r")
-        data_chir = _arr(data, "chir_mag")
-        fit_chir = _arr(model, "chir_mag")
-        resid_r = None
-        if data_chir is not None and fit_chir is not None and len(data_chir) == len(fit_chir):
-            resid_r = data_chir - fit_chir
-
-        res = FitResult(ok=True, message="fit done")
-        res.params = params_out
-        res.statistics = {
-            "r_factor": r_factor,
-            "chi_square": chi2,
-            "redchi": redchi,
-            "n_independent": n_ind,
-            "n_varys": int(getattr(out, "nvarys", 0) or 0),
-        }
-        res.paths = path_infos
-        res.correlations = sorted(corrs, key=lambda x: -abs(x[2]))
-        res.report_text = str(report)
-        res.k = fit_k
-        res.chi = data_chi
-        res.fit_k = fit_k if fit_chi is not None else None
-        res.fit_chi = fit_chi
-        res.r = fit_r
-        res.chir_mag = data_chir
-        res.fit_r = fit_r
-        res.fit_chir_mag = fit_chir
-        res.residual_r = resid_r
-        try:
-            res.plot_views = build_fit_plot_views(
-                fit_k,
-                data_chi,
-                fit_k,
-                fit_chi,
-                settings,
-            )
-            # Keep legacy/export fields on a coherent transformed pair too.
-            # ``feffit`` itself stores only the first fitting k-weight, which
-            # must never be compared against an Athena FT at another weight.
-            preferred_weight = int(settings.kw_list[0]) if settings.kw_list else 2
-            view = res.plot_views.get(preferred_weight) or next(iter(res.plot_views.values()), None)
-            if view:
-                res.r = view["r"]
-                res.chir_mag = view["data_rmag"]
-                res.fit_r = view["r"]
-                res.fit_chir_mag = view["fit_rmag"]
-                res.residual_r = view["residual_rre"]
-        except Exception:
-            # A fit result stays valid even if a display-only transform fails.
-            # The UI will retain its basic k/R overlay and show the error-free
-            # numerical report rather than turning a completed fit into failure.
-            res.plot_views = {}
-        return res
-    except Exception as exc:
-        res = FitResult(ok=False, message=f"{exc}")
-        res.report_text = traceback.format_exc()
-        return res
 
 
 # =====================================================================
@@ -1503,6 +1787,9 @@ def save_fit_to_history(
     settings: FitSettings,
     data_desc: str = "",
     history_dir: Optional[Path] = None,
+    structure_models: Optional[List[dict]] = None,
+    fit_mode: str = "",
+    search: Optional[dict] = None,
 ) -> Optional[Path]:
     """Snapshot one fit (params/paths/settings/report) for later restore/compare."""
     if not result.ok:
@@ -1523,6 +1810,32 @@ def save_fit_to_history(
         }
         for weight, view in (result.plot_views or {}).items()
     }
+    # A joint fit describes several datasets: name them in the row and keep one
+    # record per dataset (settings + its own R-factor + its own curves).
+    joint = bool(getattr(result, "joint", False) and result.datasets)
+    if joint:
+        names = [str(d.get("name", "")) for d in result.datasets]
+        data_desc = f"joint({len(names)}): " + " + ".join(names)
+    dataset_snaps: List[Dict[str, Any]] = []
+    if joint:
+        for row in result.datasets:
+            views = {
+                str(weight): {
+                    str(name): np.asarray(values, dtype=float).tolist()
+                    for name, values in (view or {}).items()
+                }
+                for weight, view in (row.get("plot_views") or {}).items()
+            }
+            dataset_snaps.append(
+                {
+                    "name": row.get("name", ""),
+                    "tag": row.get("tag", ""),
+                    "settings": row.get("settings") or {},
+                    "r_factor": row.get("r_factor"),
+                    "n_idp": row.get("n_idp"),
+                    "plot_views": views,
+                }
+            )
     snap = {
         "stamp": stamp,
         "data": data_desc,
@@ -1535,6 +1848,18 @@ def save_fit_to_history(
         "correlations": [list(c) for c in result.correlations],
         "report_text": result.report_text,
         "plot_views": plot_views,
+        # Where the FEFF paths came from (CIF / AMCSD / user file).  Read-only
+        # evidence for AI Check and for the report; never used to rebuild paths.
+        "structure_models": list(structure_models or []),
+        "joint": bool(joint),
+        "datasets": dataset_snaps,
+        # v4.9.0: audit / fit mode / the phase search that produced this model
+        "fit_mode": str(fit_mode or getattr(result, "fit_mode", "") or ""),
+        "audit": [
+            f.to_dict() if hasattr(f, "to_dict") else dict(f)
+            for f in (getattr(result, "audit", None) or [])
+        ],
+        "search": dict(search) if isinstance(search, dict) else None,
     }
     fp = hdir / f"fit_{stamp}_R{rf:.4f}.json"
     fp.write_text(json.dumps(snap, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
@@ -1558,6 +1883,8 @@ def list_fit_history(history_dir: Optional[Path] = None) -> List[Dict[str, Any]]
                     "r_factor": d.get("statistics", {}).get("r_factor"),
                     "n_paths": len(d.get("paths", [])),
                     "has_curves": bool(d.get("plot_views")),
+                    "joint": bool(d.get("joint")),
+                    "n_datasets": len(d.get("datasets") or []),
                 }
             )
         except Exception:
@@ -1583,3 +1910,141 @@ def clear_fit_history(history_dir: Optional[Path] = None) -> int:
 def load_fit_snapshot(json_path: str | Path) -> Dict[str, Any]:
     """Full snapshot for restore: gds / paths / settings / report_text."""
     return json.loads(Path(json_path).read_text(encoding="utf-8"))
+
+
+# =====================================================================
+# Model comparison (Hamilton F-test)
+# =====================================================================
+
+
+def hamilton_test(base: Dict[str, Any], ext: Dict[str, Any]) -> Dict[str, Any]:
+    """Hamilton (1965) F-test between a smaller and a larger EXAFS model.
+
+    Arguments are dicts with chi_square / n_varys / n_independent (a snapshot's
+    statistics block works).  The model with fewer variables is the BASE; the
+    other one is EXT.  Deliberately not larch's fitting.f_test: that wrapper
+    drops the nfix argument it receives (see the plan's evidence), so its
+    probability is wrong whenever more than one parameter was added.
+    """
+    if not base or not ext:
+        raise ValueError("two models are required")
+    try:
+        nb = int(base.get("n_varys"))
+        ne = int(ext.get("n_varys"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("n_varys missing") from exc
+    if nb == 0 and ne == 0:
+        raise ValueError("Both models have no variable parameters")
+    if nb > ne:
+        base, ext = ext, base
+        nb, ne = ne, nb
+    elif nb == ne:
+        raise ValueError("The two models have the same number of variables")
+    chi_b = float(base.get("chi_square", float("nan")))
+    chi_e = float(ext.get("chi_square", float("nan")))
+    if not (np.isfinite(chi_b) and np.isfinite(chi_e)):
+        raise ValueError("A model has no chi-square")
+    nidp = float(base.get("n_independent", ext.get("n_independent", float("nan"))))
+    if not np.isfinite(nidp):
+        raise ValueError("n_independent missing")
+    b = ne - nb
+    dof = nidp - ne
+    if dof <= 0:
+        raise ValueError("The larger model leaves no degrees of freedom")
+    if chi_e >= chi_b:
+        return {
+            "p": 1.0,
+            "F": 0.0,
+            "b": int(b),
+            "dof": float(dof),
+            "verdict": "not_better",
+            "base": base,
+            "ext": ext,
+        }
+    F = ((chi_b - chi_e) / b) / (chi_e / dof)
+    from scipy.stats import f as _f_dist
+
+    p = float(1.0 - _f_dist.cdf(F, b, dof))
+    return {
+        "p": p,
+        "F": float(F),
+        "b": int(b),
+        "dof": float(dof),
+        "verdict": "significant" if p < 0.05 else "not_significant",
+        "base": base,
+        "ext": ext,
+    }
+
+
+_SNAPSHOT_WINDOW_KEYS = (
+    "kmin", "kmax", "dk", "kwindow", "rmin", "rmax", "dr", "rwindow", "kw_list",
+)
+
+
+def _same_windows(sa: Dict[str, Any], sb: Dict[str, Any]) -> bool:
+    """Same k/R windows (including the k-weight list)?"""
+    for key in _SNAPSHOT_WINDOW_KEYS:
+        va, vb = sa.get(key), sb.get(key)
+        if key == "kw_list":
+            if [int(x) for x in (va or [])] != [int(x) for x in (vb or [])]:
+                return False
+            continue
+        if va is None and vb is None:
+            continue
+        try:
+            if abs(float(va) - float(vb)) > 1e-9:
+                return False
+        except (TypeError, ValueError):
+            if va != vb:
+                return False
+    return True
+
+
+def compare_snapshots(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    """Are two saved fits comparable, and if so how do they compare?
+
+    Only the same data, the same windows and the same number of independent
+    points may be compared (Hamilton's test assumes nested models on one
+    dataset).  Uncomparable pairs return the reason as an i18n key.
+    """
+    a = a or {}
+    b = b or {}
+    if bool(a.get("joint")) != bool(b.get("joint")):
+        return {"comparable": False, "why": "hamilton_why_data"}
+    # joint snapshots are matched by their dataset set below ("A + B" == "B + A")
+    if not bool(a.get("joint")) and str(a.get("data", "")) != str(b.get("data", "")):
+        return {"comparable": False, "why": "hamilton_why_data"}
+    if bool(a.get("joint")):
+        da = {str(d.get("name", "")): d for d in (a.get("datasets") or [])}
+        db = {str(d.get("name", "")): d for d in (b.get("datasets") or [])}
+        if set(da) != set(db) or not da:
+            return {"comparable": False, "why": "hamilton_why_data"}
+        for name in da:
+            if not _same_windows(dict(da[name].get("settings") or {}), dict(db[name].get("settings") or {})):
+                return {"comparable": False, "why": "hamilton_why_windows"}
+    if not _same_windows(dict(a.get("settings") or {}), dict(b.get("settings") or {})):
+        return {"comparable": False, "why": "hamilton_why_windows"}
+    ta = dict(a.get("statistics") or {})
+    tb = dict(b.get("statistics") or {})
+    na = float(ta.get("n_independent", float("nan")))
+    nb = float(tb.get("n_independent", float("nan")))
+    if not (np.isfinite(na) and np.isfinite(nb)) or abs(na - nb) >= 1e-6:
+        return {"comparable": False, "why": "hamilton_why_nidp"}
+    if not np.isfinite(float(ta.get("chi_square", float("nan")))) or not np.isfinite(
+        float(tb.get("chi_square", float("nan")))
+    ):
+        return {"comparable": False, "why": "hamilton_why_missing"}
+    if int(ta.get("n_varys", 0) or 0) == int(tb.get("n_varys", 0) or 0):
+        return {"comparable": False, "why": "hamilton_why_nvar"}
+    try:
+        result = hamilton_test(ta, tb)
+    except ValueError as exc:
+        return {"comparable": False, "why": "hamilton_why_missing", "detail": str(exc)}
+    result["comparable"] = True
+    # hamilton_test takes the smaller model as base whatever the order; the
+    # stamps must follow it (history lists newest first, usually the larger)
+    a_is_base = int(ta.get("n_varys", 0) or 0) < int(tb.get("n_varys", 0) or 0)
+    base, ext = (a, b) if a_is_base else (b, a)
+    result["base_stamp"] = str(base.get("stamp", ""))
+    result["ext_stamp"] = str(ext.get("stamp", ""))
+    return result
