@@ -1,9 +1,9 @@
 {
   "name": "smartLarch Platform",
-  "version": "5.1.0",
+  "version": "5.3.0",
   "os": "windows",
-  "path": "smartLarch-Platform_Windows_v5.1.0.zip",
-  "sha256": "502bc1c8c16dead4c912f72981ccc26b491ca62c0c2fad2551ef9a0a07b13533",
-  "generated_at": "2026-10-28T03:22:57Z",
+  "path": "smartLarch-Platform_Windows_v5.3.0.zip",
+  "sha256": "944ea351c320c561388b12811c2ec98a1e25adf215c8b1c52dc2f4db6b490dec",
+  "generated_at": "2026-11-03T03:33:35Z",
   "notes": "Zip is at project root. Plugins update separately under plugins/."
 }

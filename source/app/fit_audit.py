@@ -37,6 +37,13 @@ DEFAULT_LIMITS: Dict[str, Any] = {
     "corr": {"warn": 0.90, "fail": 0.95},
     # chi2_nu large while R is small: the noise estimate is probably wrong
     "noise_suspect": {"chi2nu": 50.0, "rfactor": 0.02},
+    # v5.2.0: a fit window starting below AUTOBK's rbkg fits data AUTOBK has just flattened
+    "rmin_vs_rbkg": {"warn": 0.05},
+    # v5.2.0: rbkg as a fraction of the first-shell distance; ~0.5 is the rule of thumb
+    "rbkg_ratio": {"warn": 0.55, "fail": 0.62},
+    # v5.3.0: the paper table marks a CN with a relative error above this (†); a table mark
+    # only - it adds no audit flag and changes no verdict
+    "cn_rel_err": {"warn": 0.45},
 }
 
 
@@ -244,6 +251,26 @@ def audit_fit(
                         "deltar", "warn", label, dr, f"|dR| <= {lim['deltar']['warn']:g} A"
                     )
                 )
+
+    # v5.2.0 background vs fit window: needs the per-dataset settings (Model A has none)
+    for ds in getattr(result, "datasets", None) or []:
+        st = (ds or {}).get("settings") or {}
+        rmin, rbkg = _num(st.get("rmin")), _num(st.get("rbkg"))
+        if not (math.isfinite(rmin) and math.isfinite(rbkg)):
+            continue
+        name = str((ds or {}).get("name") or "")
+        if rmin < rbkg - lim["rmin_vs_rbkg"]["warn"]:
+            flags.append(AuditFlag("rmin_below_rbkg", "warn", name, rmin, f"{rbkg:.2f}"))
+        ds_paths = (ds or {}).get("paths") or paths
+        radii = [_num((p or {}).get("r")) for p in ds_paths]
+        radii = [r for r in radii if math.isfinite(r) and r > 0]
+        if radii:
+            ratio = rbkg / min(radii)
+            warn, fail = lim["rbkg_ratio"]["warn"], lim["rbkg_ratio"]["fail"]
+            if ratio > fail:
+                flags.append(AuditFlag("rbkg_first_shell", "fail", name, ratio, f"< {fail:.2f}"))
+            elif ratio > warn:
+                flags.append(AuditFlag("rbkg_first_shell", "warn", name, ratio, f"< {warn:.2f}"))
 
     # chi2_nu large while R small: the noise estimate is probably wrong
     redchi = _num(stats.get("redchi"))

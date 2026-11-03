@@ -71,6 +71,9 @@ class FitSettings:
     rwindow: str = "hanning"
     fit_space: str = "r"  # r | k | q
     rbkg: float = 1.0
+    # v5.2.0: refine the background spline together with the structure (larch
+    # refine_bkg).  A cross-check only: never on by default, never persisted.
+    refine_bkg: bool = False
     # Model A fixed / free
     amp: float = 0.67
     e0_init: float = 8.0
@@ -121,12 +124,22 @@ class FitResult:
     # acceptance fix 2026-10-27: the GDS rows actually fitted ({ds} expanded) — the audit needs
     # their min/max; never saved, never shown
     gds_used: List[Any] = field(default_factory=list)
+    # v5.2.0 joint fit with a reference standard: {"dataset", "path", "n"} or None
+    # (joint itself is a bool, so the reference lives next to it)
+    reference: Optional[Dict[str, Any]] = None
 
     def to_text(self) -> str:
         lines = []
         shell_text = format_shell_table(self) if self.ok else ""
         if shell_text:
             lines += [shell_text, ""]
+        ref = self.reference
+        if ref:
+            lines += [
+                f"S0^2 is set by the reference dataset {ref.get('dataset')} "
+                f"({ref.get('path')}, N = {ref.get('n'):g} fixed)",
+                "",
+            ]
         lines += [self.report_text or "", ""]
         if self.audit:
             # v4.9.0: the parameter audit is part of every fit report.
@@ -160,8 +173,12 @@ def build_fit_plot_views(
     xftf_func=None,
     xftr_func=None,
     group_factory=None,
+    bkg_chi=None,
 ) -> Dict[int, Dict[str, np.ndarray]]:
     """Return k/R/q plotting arrays for every requested k-weight.
+
+    ``bkg_chi`` (v5.2.0): the refined background spline on the data k grid; when
+    given, every view also carries ``bkg_kchi`` and ``bkg_rmag``.
 
     ``feffit`` only writes one transformed output (the first fitting weight),
     while Artemis plot weights are purely a display choice.  Re-transform both
@@ -233,6 +250,12 @@ def build_fit_plot_views(
             "data_qre": np.asarray(data.chiq_re[:nq], dtype=float).copy(),
             "fit_qre": np.asarray(model.chiq_re[:nq], dtype=float).copy(),
         }
+        if bkg_chi is not None:
+            bkg = np.asarray(bkg_chi, dtype=float)[:n]
+            if bkg.size == k.size:
+                bg = _transformed(bkg, kw)
+                views[kw]["bkg_kchi"] = bkg * k**kw
+                views[kw]["bkg_rmag"] = np.asarray(bg.chir_mag[:nr], dtype=float).copy()
     return views
 
 
@@ -1378,6 +1401,94 @@ def _prune_unused_ds_copies(
     return [r for r in rows if str(r.name).strip() not in dropped]
 
 
+def reference_dataset_rows(
+    paths: Sequence[PathDef],
+    gds: Sequence[GDSParam],
+    dataset_name: str,
+    path_label: str,
+    n_known: float,
+    s02_value: float = 0.6,
+    s02_min: float = 0.3,
+    s02_max: float = 1.2,
+) -> Tuple[List[PathDef], List[GDSParam]]:
+    """Return (new_paths, new_gds) with ``dataset_name`` as the S0^2 reference (v5.2.0).
+
+    The chosen path row is copied to that dataset (PathDef.data = dataset_name)
+    with its amplitude rewritten from ``<s02>*<n>`` to ``<s02>*<n_known>``; the
+    S0^2 GDS row becomes a guess with the given bounds.  The standard's N is
+    then fixed at its known value and S0^2 is determined by all datasets
+    together.  Only the existing path-level override is used (the ``all`` row
+    stays, the copy replaces it for this dataset: ``_paths_for_group``).
+
+    Raises ValueError (never guesses) when the amplitude is not exactly
+    ``<s02 name>*<n name>``, when ``<s02 name>`` is not a GDS row or is a def
+    bound to something else, when the dataset already has its own row for that
+    FEFF file, when the path label is unknown, or when a CN factor ``cnr_*`` is
+    in use (a reference S0^2 and a CN factor cannot be fitted together).
+    """
+    import re as _re
+
+    name = str(dataset_name or "").strip()
+    if not name:
+        raise ValueError("参考数据集未选择 / no reference dataset chosen")
+    n_known = float(n_known)
+    rows = [replace(p) for p in paths]
+    gds_rows = [replace(g) for g in gds]
+    gds_by_name = {str(g.name).strip(): g for g in gds_rows}
+
+    used_names: set = set()
+    for p in rows:
+        used_names |= _expr_names(p.s02)
+    cnr = sorted(n for n in gds_by_name if n.lower().startswith("cnr_") and n in used_names)
+    if cnr:
+        raise ValueError(
+            "参考标样定 S0² 与 CN 因子不能同时用（" + ", ".join(cnr) + "） / "
+            "a reference S0^2 and a CN factor cannot be used together (" + ", ".join(cnr) + ")"
+        )
+
+    src = next((p for p in rows if str(p.label) == str(path_label) and not str(p.data or "").strip()), None)
+    if src is None:
+        raise ValueError(f"找不到路径 {path_label!r}（或它已指定了数据集） / path {path_label!r} not found among the 'All' rows")
+    if any(
+        str(p.data or "").strip() == name
+        and os.path.normcase(os.path.abspath(str(p.feff_file))) == os.path.normcase(os.path.abspath(str(src.feff_file)))
+        for p in rows
+    ):
+        raise ValueError(
+            f"{name} 已有这条 FEFF 文件的专用行 / {name} already has its own row for this FEFF file"
+        )
+
+    amp = str(src.s02 or "").replace(" ", "")
+    tokens = amp.split("*")
+    ident = _re.compile(r"^[A-Za-z_][A-Za-z0-9_{}]*$")
+    if len(tokens) != 2 or not all(ident.match(t) for t in tokens):
+        raise ValueError(
+            f"振幅必须正好是 <s02>*<N>，现在是 {src.s02!r} / amplitude must be exactly <s02>*<N>, got {src.s02!r}"
+        )
+    s02_tok = next((t for t in tokens if t in gds_by_name and t.lower().startswith("s02")), "")
+    if not s02_tok:
+        raise ValueError(
+            f"振幅 {src.s02!r} 里没有名字以 s02 开头的 GDS 行 / no GDS row starting with 's02' in {src.s02!r}"
+        )
+    s02_row = gds_by_name[s02_tok]
+    if s02_row.kind == "expr" or s02_row.kind == "skip":
+        raise ValueError(
+            f"{s02_tok} 是 {s02_row.kind} 行，不能当作参考 S0² / {s02_tok} is a {s02_row.kind} row and cannot be the reference S0^2"
+        )
+
+    s02_row.kind = "vary"
+    s02_row.expr = ""
+    s02_row.value = float(s02_value)
+    s02_row.min = float(s02_min)
+    s02_row.max = float(s02_max)
+
+    ref = replace(src)
+    ref.data = name
+    ref.s02 = f"{s02_tok}*{n_known:g}"
+    rows.append(ref)
+    return rows, gds_rows
+
+
 @dataclass
 class FitDataset:
     """One dataset of a (possibly joint) fit: group + windows + its paths."""
@@ -1441,6 +1552,11 @@ def _build_feffpaths(L, used: Sequence[PathDef]):
 
 
 def _transform_for(L, settings: FitSettings):
+    kw: Dict[str, Any] = {}
+    if getattr(settings, "refine_bkg", False):
+        # rbkg reaches the transform ONLY for a refined background: passing it
+        # also moves the q-space window start, so the plain fit stays untouched
+        kw["rbkg"] = float(settings.rbkg)
     return L["feffit_transform"](
         kmin=settings.kmin,
         kmax=settings.kmax,
@@ -1452,7 +1568,19 @@ def _transform_for(L, settings: FitSettings):
         rmax=settings.rmax,
         dr=settings.dr,
         rwindow=settings.rwindow,
+        **kw,
     )
+
+
+def refine_bkg_budget(settings: FitSettings, n_other_vars: int = 0) -> Dict[str, float]:
+    """Variables a refined background adds and the independent points left (larch rules).
+
+    nspline = 1 + round(2*max(rbkg, rmin)*dk/pi) extra variables per dataset;
+    the independent points become 1 + 2*rmax*dk/pi because the window starts at 0."""
+    dkk = float(settings.kmax) - float(settings.kmin)
+    nspline = 1 + int(round(2.0 * max(float(settings.rbkg), float(settings.rmin)) * dkk / np.pi))
+    nidp = 1.0 + 2.0 * float(settings.rmax) * dkk / np.pi
+    return {"nspline": float(nspline), "n_idp": float(nidp), "n_vars": float(n_other_vars + nspline)}
 
 
 def _param_value(out, name: str) -> Tuple[float, float]:
@@ -1562,6 +1690,21 @@ def _path_infos(feff_paths, out, params_out: Dict[str, Any], dset) -> List[Dict[
             r_v = reff + deltar_v if np.isfinite(reff) else float("nan")
         else:
             r_v = reff + dr_v if np.isfinite(reff) else float("nan")
+        # v5.3.0 (paper table): e0 error (single parameter -> its stderr, else larch's
+        # propagated one), absorber / scatterers / nleg from the FEFF path geometry
+        e0_expr = (pd.e0 or "").strip()
+        if e0_expr in params_out:
+            e0_err = params_out[e0_expr]["stderr"]
+        else:
+            e0_err = _fe_err("e0")
+        try:
+            geom = [str(a[0]) for a in (getattr(fp, "geom", None) or [])]
+        except Exception:
+            geom = []
+        try:
+            nleg = int(getattr(fp, "nleg"))
+        except Exception:
+            nleg = None
         path_infos.append(
             {
                 "label": pd.label or Path(pd.feff_file).stem,
@@ -1571,6 +1714,10 @@ def _path_infos(feff_paths, out, params_out: Dict[str, Any], dset) -> List[Dict[
                 "s02": _fe("s02"),
                 "s02_err": _fe_err("s02"),
                 "e0": _fe("e0"),
+                "e0_err": e0_err,
+                "absorber": geom[0] if geom else "",
+                "scatterers": geom[1:],
+                "nleg": nleg,
                 "deltar": deltar_v,
                 "sigma2": _fe("sigma2"),
                 "sigma2_err": _fe_err("sigma2"),
@@ -1600,6 +1747,18 @@ def shell_rows(result) -> List[Dict[str, Any]]:
     parameter (N held at the crystallographic value).
     """
     params = dict(getattr(result, "params", {}) or {})
+    # v5.2.0: a sigma^2 parameter sitting on its lower bound makes N a lower limit
+    # (N and sigma^2 trade off); same 1 % of span criterion as the audit's at_bound
+    at_min = set()
+    for g in getattr(result, "gds_used", None) or []:
+        lo, hi = getattr(g, "min", None), getattr(g, "max", None)
+        name = str(getattr(g, "name", "")).strip()
+        if getattr(g, "kind", "") != "vary" or lo is None or hi is None or name not in params:
+            continue
+        span = float(hi) - float(lo)
+        value = _num_or_nan(params[name].get("value"))
+        if span > 0 and np.isfinite(value) and (value - float(lo)) / span < 0.01:
+            at_min.add(name)
     rows: List[Dict[str, Any]] = []
     for p in getattr(result, "paths", None) or []:
         degen = _num_or_nan(p.get("degen"))
@@ -1618,6 +1777,8 @@ def shell_rows(result) -> List[Dict[str, Any]]:
                 cn = degen * amp / s02_value
                 if str(info.get("kind")) != "vary" and np.isfinite(amp_err):
                     cn_err = degen * amp_err / s02_value
+        cn_fixed = not [n for n in free if not n.lower().startswith("s02")]
+        sigma_names = _expr_names(str((p.get("exprs") or {}).get("sigma2") or ""))
         rows.append(
             {
                 "label": p.get("label", ""),
@@ -1626,7 +1787,10 @@ def shell_rows(result) -> List[Dict[str, Any]]:
                 "cn": cn,
                 "cn_err": cn_err,
                 # S0^2 alone free (a standard) still leaves N at the bulk value
-                "cn_fixed": not [n for n in free if not n.lower().startswith("s02")],
+                "cn_fixed": cn_fixed,
+                "cn_lower_bound": bool(not cn_fixed and (sigma_names & at_min)),
+                # v5.3.0 (paper table): sigma^2 itself on its lower bound, whether N is fitted or not
+                "ss_at_bound": bool(sigma_names & at_min),
                 "s02": s02_value,
                 "r": _num_or_nan(p.get("r")),
                 "r_err": _num_or_nan(p.get("r_err")),
@@ -1655,7 +1819,11 @@ def format_shell_table(result) -> str:
     lines.append(f"  {'path':<22s} {'CN':<18s} {'R (A)':<20s} {'sigma^2 (A^2)':<20s}")
     for row in rows:
         if np.isfinite(row["cn"]):
-            cn = _pm(row["cn"], row["cn_err"], ".2f") + (" (fixed)" if row["cn_fixed"] else "")
+            cn = (
+                _pm(row["cn"], row["cn_err"], ".2f")
+                + (" (fixed)" if row["cn_fixed"] else "")
+                + (" (lower bound)" if row.get("cn_lower_bound") else "")
+            )
         else:
             cn = "N*S0^2 " + _pm(row["n_s02"], float("nan"), ".3f")
         lines.append(
@@ -1669,6 +1837,198 @@ def format_shell_table(result) -> str:
             + "; (fixed) = N not fitted"
         )
     return "\n".join(lines)
+
+
+def _path_name(info: Dict[str, Any]) -> str:
+    """'Ni–O' for a single-scattering path, 'Ni–O–Ni (MS)' for multiple scattering;
+    the path label when the FEFF geometry is not available."""
+    absorber = str(info.get("absorber") or "")
+    scatterers = [str(s) for s in (info.get("scatterers") or [])]
+    if not absorber or not scatterers:
+        return str(info.get("label") or "")
+    nleg = info.get("nleg")
+    chain = "–".join([absorber] + scatterers)
+    if isinstance(nleg, int) and nleg > 2:
+        return chain + " (MS)"
+    return chain
+
+
+def paper_table_blocks(entries: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Paper-table blocks and notes (v5.3.0) from the last fit(s); Qt-free, computes nothing new.
+
+    Every ``entries`` item: ``sample`` (str), ``element``, ``edge``, ``e0`` (eV or None), ``kmin``,
+    ``kmax``, ``rmin``, ``rmax``, ``kweights``, ``window``, ``dk``, ``result`` (FitResult) and, for a
+    joint fit, ``dataset_index`` (position in ``result.datasets``).  CN, R and sigma^2 are those of
+    ``shell_rows`` (per dataset for a joint fit); the R-factor is the dataset's own
+    (``datasets[i]["r_factor"]``, else ``statistics["r_factor"]``).  The reference standard of a
+    joint fit (``FitResult.reference``) comes first in its edge block.  Format:
+    ``paper_table.py`` (copy of the xas-processing skill module)."""
+    from types import SimpleNamespace
+
+    from . import paper_table as PT
+
+    order: List[Tuple[str, str]] = []
+    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for ent in entries:
+        key = (str(ent.get("element") or ""), str(ent.get("edge") or ""))
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(ent)
+
+    blocks: List[Dict[str, Any]] = []
+    s02_lines: List[str] = []
+    e0_parts: List[str] = []
+    shared_names: List[str] = []
+    for key in order:
+        element, edge = key
+        ents = grouped[key]
+
+        def _is_ref(e: Dict[str, Any]) -> bool:
+            ref = getattr(e.get("result"), "reference", None) or {}
+            return bool(ref) and str(ref.get("dataset")) == str(e.get("sample"))
+
+        ents = [e for e in ents if _is_ref(e)] + [e for e in ents if not _is_ref(e)]
+        rows: List[Dict[str, Any]] = []
+        for ent in ents:
+            res = ent["result"]
+            idx = ent.get("dataset_index")
+            datasets = list(getattr(res, "datasets", None) or [])
+            if idx is not None and 0 <= int(idx) < len(datasets):
+                ds = datasets[int(idx)]
+                view = SimpleNamespace(
+                    params=res.params, paths=list(ds.get("paths") or []), gds_used=getattr(res, "gds_used", [])
+                )
+                rfac = ds.get("r_factor")
+            else:
+                view = res
+                rfac = (getattr(res, "statistics", None) or {}).get("r_factor")
+            infos = list(getattr(view, "paths", None) or [])
+            seen: Dict[str, int] = {}
+            pairs = list(zip(infos, shell_rows(view)))
+            # shells in order of distance (nominal Reff), whatever order the table had
+            pairs.sort(key=lambda p: (not np.isfinite(_num_or_nan(p[1].get("reff"))), _num_or_nan(p[1].get("reff"))))
+            for info, srow in pairs:
+                name = _path_name(info)
+                seen[name] = seen.get(name, 0) + 1
+                if seen[name] > 1:
+                    name = f"{name} ({info.get('label') or seen[name]})"
+                exprs = info.get("exprs") or {}
+                s02_names = [
+                    n for n in sorted(_expr_names(str(exprs.get("s02") or "")))
+                    if n.lower().startswith("s02") and n in res.params
+                ]
+                # S0^2 carries an error only where it is determined: a fitted S0^2 of a foil /
+                # standard row; with a reference standard only that dataset's rows carry it
+                s02_err = None
+                ref_info = getattr(res, "reference", None) or {}
+                determined_here = (not ref_info) or _is_ref(ent)
+                if (len(s02_names) == 1 and determined_here
+                        and str(res.params[s02_names[0]].get("kind")) == "vary"):
+                    s02_err = res.params[s02_names[0]].get("stderr")
+                s02_val = srow["s02"] if np.isfinite(srow["s02"]) else None
+                # With S0^2 fitted, shell_rows has no CN error (it would need the covariance).
+                # When the amplitude is exactly <s02>*<N> with N one fitted parameter and the
+                # degeneracy 1, CN *is* that parameter, so its own stderr is the CN error.
+                cn_err = srow["cn_err"]
+                if not np.isfinite(_num_or_nan(cn_err)) and np.isfinite(_num_or_nan(srow["cn"])):
+                    toks = [n for n in _expr_names(str(exprs.get("s02") or ""))]
+                    others = [n for n in toks if not n.lower().startswith("s02")]
+                    if (len(toks) == 2 and len(others) == 1 and others[0] in res.params
+                            and str(res.params[others[0]].get("kind")) == "vary"
+                            and abs(_num_or_nan(srow["n_s02"]) / max(_num_or_nan(srow["s02"]), 1e-12)
+                                    - _num_or_nan(res.params[others[0]].get("value")))
+                            <= 1e-3 * max(abs(_num_or_nan(res.params[others[0]].get("value"))), 1e-3)):
+                        cn_err = res.params[others[0]].get("stderr")
+                rows.append(
+                    {
+                        "sample": str(ent.get("sample") or ""),
+                        "path": name,
+                        "cn": srow["cn"],
+                        "cn_err": cn_err,
+                        "cn_fixed": bool(srow["cn_fixed"]),
+                        "cn_lower_bound": bool(srow.get("cn_lower_bound")),
+                        "amp": srow["n_s02"],
+                        "r": srow["r"],
+                        "r_err": srow["r_err"],
+                        "ss": srow["sigma2"],
+                        "ss_err": srow["sigma2_err"],
+                        "ss_at_bound": bool(srow.get("ss_at_bound")),
+                        "de0": info.get("e0"),
+                        "de0_err": info.get("e0_err"),
+                        "s02": s02_val,
+                        "s02_err": s02_err,
+                        "rfactor": rfac,
+                    }
+                )
+        blocks.append({"title": f"{element} {edge}-edge".replace("  ", " ").strip(), "rows": rows})
+
+        e0s = sorted({round(float(e["e0"]), 1) for e in ents if _num_or_nan(e.get("e0")) == _num_or_nan(e.get("e0"))})
+        if e0s:
+            e0_parts.append(f"{', '.join(f'{v:.1f}' for v in e0s)} eV ({element} {edge} edge)")
+        for ent in ents:
+            ref = getattr(ent.get("result"), "reference", None)
+            if ref and str(ref.get("dataset")) == str(ent.get("sample")):
+                line = (
+                    f"S₀² was refined jointly with the reference standard {ref.get('dataset')} "
+                    f"(N of {ref.get('path')} fixed at {float(ref.get('n')):g}) and is common to all datasets."
+                )
+                if line not in s02_lines:
+                    s02_lines.append(line)
+
+    # S0^2 statement for the fits without a reference standard
+    all_ents = [e for k in order for e in grouped[k]]
+    if not s02_lines and all_ents:
+        res0 = all_ents[0]["result"]
+        fitted = [n for n, p in (res0.params or {}).items()
+                  if str(n).lower().startswith("s02") and str(p.get("kind")) == "vary"]
+        fixed = sorted({
+            round(float(p.get("value")), 3) for n, p in (res0.params or {}).items()
+            if str(n).lower().startswith("s02") and str(p.get("kind")) != "vary" and np.isfinite(_num_or_nan(p.get("value")))
+        })
+        if fitted:
+            s02_lines.append("S₀² was refined in the fit (" + ", ".join(fitted) + ").")
+        elif fixed:
+            s02_lines.append("S₀² was fixed at " + ", ".join(f"{v:g}" for v in fixed) + " in the fit.")
+    # parameters shared between datasets (no dataset tag in the name) in a joint fit
+    for ent in all_ents:
+        res = ent["result"]
+        ds = list(getattr(res, "datasets", None) or [])
+        if len(ds) > 1:
+            tags = [str(d.get("tag") or "") for d in ds]
+            for n, p in (res.params or {}).items():
+                if str(p.get("kind")) == "vary" and not any(t and str(n).endswith("_" + t) for t in tags):
+                    if n not in shared_names:
+                        shared_names.append(str(n))
+            break
+    windows = []
+    for key in order:
+        e = grouped[key][0]
+        windows.append(
+            {"label": f"{key[0]} {key[1]}".strip(), "kmin": float(e["kmin"]), "kmax": float(e["kmax"]),
+             "rmin": float(e["rmin"]), "rmax": float(e["rmax"])}
+        )
+    first_ent = all_ents[0] if all_ents else {}
+    kweights = tuple(first_ent.get("kweights") or (1, 2, 3))
+    window = str(first_ent.get("window") or "hanning").capitalize()
+    e0_line = ""
+    if e0_parts:
+        e0_line = (
+            "E₀ was set to " + "; ".join(e0_parts) + "; ΔE₀ is the refined shift from these values."
+        )
+    shared_line = ""
+    if shared_names:
+        shared_line = "Shared between the datasets of the joint fit: " + ", ".join(shared_names) + "."
+    notes = PT.default_notes(
+        windows,
+        kweights=kweights,
+        window=window,
+        dk=float(first_ent.get("dk", 1.0)) if first_ent else 1.0,
+        s02_lines=s02_lines,
+        e0_line=e0_line,
+        shared_line=shared_line,
+    )
+    return blocks, notes
 
 
 def _arr(obj, name):
@@ -1687,9 +2047,23 @@ def _dataset_views(dset, settings: FitSettings) -> Dict[int, Dict[str, np.ndarra
     if fit_k is None or data_chi is None or fit_chi is None:
         return {}
     try:
-        return build_fit_plot_views(fit_k, data_chi, fit_k, fit_chi, settings)
+        return build_fit_plot_views(
+            fit_k, data_chi, fit_k, fit_chi, settings, bkg_chi=_bkg_on_grid(dset, fit_k)
+        )
     except Exception:
         return {}
+
+
+def _bkg_on_grid(dset, k: np.ndarray):
+    """The refined background (refine_bkg only) on grid *k*, else None."""
+    if not getattr(dset, "refine_bkg", False):
+        return None
+    bkg = _arr(dset.data, "bkgk")
+    if bkg is None or bkg.size < 2:
+        return None
+    if bkg.size != np.asarray(k).size:
+        return None
+    return bkg
 
 
 def _dataset_rfactor(dset, params_obj, settings: FitSettings) -> Tuple[float, float]:
@@ -1729,7 +2103,10 @@ def _apply_result_arrays(res: FitResult, out_dataset, settings: FitSettings) -> 
     res.fit_chir_mag = fit_chir
     res.residual_r = resid_r
     try:
-        res.plot_views = build_fit_plot_views(fit_k, data_chi, fit_k, fit_chi, settings)
+        res.plot_views = build_fit_plot_views(
+            fit_k, data_chi, fit_k, fit_chi, settings,
+            bkg_chi=_bkg_on_grid(out_dataset, fit_k) if fit_k is not None else None,
+        )
         preferred_weight = int(settings.kw_list[0]) if settings.kw_list else 2
         view = res.plot_views.get(preferred_weight) or next(iter(res.plot_views.values()), None)
         if view:
@@ -1788,6 +2165,23 @@ def run_feffit_multi(datasets: Sequence["FitDataset"], gds: Sequence[GDSParam]) 
     rows = _prune_unused_ds_copies(gds, rows, tags, path_exprs)
     active = _active_gds(rows)
 
+    # v5.2.0 refined background: each dataset adds spline variables and the fit
+    # window starts at R = 0, so the budget is checked up front (never guessed)
+    if any(bool(getattr(ds.settings, "refine_bkg", False)) for ds in dsets_in):
+        n_vars = float(sum(1 for g in active if g.kind == "vary"))
+        n_idp = 0.0
+        for ds in dsets_in:
+            if getattr(ds.settings, "refine_bkg", False):
+                b = refine_bkg_budget(ds.settings)
+                n_vars += b["nspline"]
+                n_idp += b["n_idp"]
+            else:
+                n_idp += 2.0 * (ds.settings.kmax - ds.settings.kmin) * (ds.settings.rmax - ds.settings.rmin) / np.pi + 2.0
+        if n_vars >= n_idp:
+            raise ValueError(
+                f"budget: {n_vars:.0f} variables (incl. background spline) >= {n_idp:.1f} independent points"
+            )
+
     try:
         pars = _build_params(L, active)
         prepared = []
@@ -1804,7 +2198,12 @@ def run_feffit_multi(datasets: Sequence["FitDataset"], gds: Sequence[GDSParam]) 
             ]
             feff_paths = _build_feffpaths(L, used)
             trans = _transform_for(L, ds.settings)
-            dset = L["feffit_dataset"](ds.group, [fp for _pd, fp in feff_paths], trans)
+            if getattr(ds.settings, "refine_bkg", False):
+                dset = L["feffit_dataset"](
+                    ds.group, [fp for _pd, fp in feff_paths], trans, refine_bkg=True
+                )
+            else:  # untouched call: a plain fit stays bit-identical
+                dset = L["feffit_dataset"](ds.group, [fp for _pd, fp in feff_paths], trans)
             prepared.append((ds, dset, feff_paths))
 
         out = L["feffit"](pars, [dset for _ds, dset, _fps in prepared])
@@ -1836,6 +2235,8 @@ def run_feffit_multi(datasets: Sequence["FitDataset"], gds: Sequence[GDSParam]) 
                     "plot_views": _dataset_views(dset, ds.settings),
                 }
             )
+            if getattr(ds.settings, "refine_bkg", False):
+                per_dataset[-1]["bkg_k"] = _bkg_on_grid(dset, _arr(dset.data, "k"))
         res.paths = all_infos
         res.datasets = per_dataset
         _apply_result_arrays(res, prepared[0][1], dsets_in[0].settings)

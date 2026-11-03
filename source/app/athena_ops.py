@@ -244,6 +244,13 @@ PRE_MIN_POINTS = 5  # a pre-edge line needs ≥5 samples ...
 PRE_MIN_SPAN = 8.0  # ... over ≥8 eV, or pre2 moves right (≤ −8) to get them
 VICT_MIN_SPAN = 100.0  # Victoreen only judged on ≥100 eV of pre-edge
 VICT_GAIN = 0.8  # ... and kept only if it cuts the long-window rms by ≥20 %
+# v5.3.0: on EXAFS-length scans the edge step swings ±3–4 % with the post-edge start as
+# EXAFS wiggles enter/leave the window (MEX1 Mn K: a 27 eV start sat on a local minimum,
+# −4 %; docs/VALIDATION.md v5.3.0). norm1 = the candidate start ≥ the XANES rule
+# whose edge step is the median; the spread is reported, not hidden.
+NORM1_CANDIDATES = (50.0, 75.0, 100.0, 125.0, 150.0)
+NORM1_SCAN_MIN_POST = 150.0  # a candidate needs ≥150 eV of post-edge after it
+NORM1_SCAN_MIN_N = 3  # at least three candidates, else keep the XANES rule
 NEXT_EDGE_MIN_STEP = 0.15  # a following edge must add ≥15 % of this edge's step
 
 
@@ -271,7 +278,9 @@ def _span_pre_norm_windows(emin_rel: float, emax_rel: float) -> Dict[str, float]
     if norm2 <= norm1:
         norm1 = max(5.0, emax_rel * 0.1)
         norm2 = max(norm1 + 15.0, emax_rel - 3.0)
-    nnorm = 3 if (norm2 - norm1) >= 180.0 else 2
+    # v5.2.0: always quadratic.  A cubic over a long post-edge window chases the
+    # EXAFS wiggles and lowers the edge step 3-4 % (docs/VALIDATION.md, v5.2.0).
+    nnorm = 2
     return {
         "pre1": float(pre1),
         "pre2": float(pre2),
@@ -301,6 +310,46 @@ def _pre_model(
     w_fit = (e_fit / e_ref) ** int(nvict)
     coef = np.polyfit(e_fit - e_ref, m_fit * w_fit, 1)
     return np.polyval(coef, e_eval - e_ref) / (e_eval / e_ref) ** int(nvict)
+
+
+def edge_step_scan(
+    energy, mu, e0: float, pre1_rel: float, pre2_rel: float, nvict: int, norm2_rel: float,
+    candidates=NORM1_CANDIDATES, nnorm: int = 2,
+) -> List[Tuple[float, float]]:
+    """Edge step for each post-edge start in *candidates* (eV rel. E0), same definition as
+    larch ``pre_edge``: post-edge polynomial (degree *nnorm*, fitted to μ on
+    [E0+norm1, E0+norm2]) minus the pre-edge model, both at E0.  Candidates that leave
+    < NORM1_SCAN_MIN_POST eV of post-edge or < 8 samples are skipped."""
+    e = np.asarray(energy, dtype=float).ravel()
+    m = np.asarray(mu, dtype=float).ravel()
+    ok = np.isfinite(e) & np.isfinite(m)
+    e, m = e[ok], m[ok]
+    pre = (e >= e0 + pre1_rel) & (e <= e0 + pre2_rel)
+    if int(pre.sum()) < 3:
+        return []
+    pre_e0 = float(_pre_model(e[pre], m[pre], int(nvict), np.array([e0]), e0)[0])
+    out: List[Tuple[float, float]] = []
+    for c in candidates:
+        if norm2_rel - c < NORM1_SCAN_MIN_POST:
+            continue
+        sel = (e >= e0 + c) & (e <= e0 + norm2_rel)
+        if int(sel.sum()) < 8:
+            continue
+        coef = np.polyfit(e[sel] - e0, m[sel], int(nnorm))
+        out.append((float(c), float(coef[-1]) - pre_e0))
+    return out
+
+
+def norm1_by_median_step(scan: List[Tuple[float, float]]) -> Tuple[Optional[float], Optional[float]]:
+    """(norm1 whose step is the median — the lower one of the middle pair for an even count,
+    relative spread (max − min)/median) of an ``edge_step_scan``; (None, None) if too few."""
+    pts = [(c, s) for c, s in scan if np.isfinite(s) and s > 0]
+    if len(pts) < NORM1_SCAN_MIN_N:
+        return None, None
+    by_step = sorted(pts, key=lambda cs: cs[1])
+    c_med, s_med = by_step[(len(by_step) - 1) // 2]
+    steps = [s for _, s in pts]
+    return float(c_med), float((max(steps) - min(steps)) / s_med)
 
 
 def _noise_sigma(y: np.ndarray) -> float:
@@ -565,7 +614,16 @@ def suggest_pre_norm_windows(
                 break
     if norm2_rel < norm1_rel + 40.0:
         norm2_rel = min(emax_rel - 5.0, norm1_rel + 40.0)
-    nnorm = 3 if (norm2_rel - norm1_rel) >= 180.0 else 2
+    # v5.2.0: always quadratic (see _span_pre_norm_windows; docs/VALIDATION.md v5.2.0)
+    nnorm = 2
+    # v5.3.0: EXAFS-length scans — norm1 = median-step candidate at/after the XANES rule
+    norm1_xanes = float(round(norm1_rel))
+    step_spread = None
+    cands = [c for c in NORM1_CANDIDATES if c >= norm1_xanes - 1e-9]
+    scan = edge_step_scan(e, m, e0, round(pre1_rel), round(pre2_rel), nvict, round(norm2_rel), cands, nnorm)
+    n1_med, spread = norm1_by_median_step(scan)
+    if n1_med is not None:
+        norm1_rel, step_spread = n1_med, spread
     return {
         "pre1": float(round(pre1_rel)),
         "pre2": float(round(pre2_rel)),
@@ -574,7 +632,85 @@ def suggest_pre_norm_windows(
         "nnorm": int(nnorm),
         "nvict": int(nvict),
         "reason": "shape",
+        "norm1_xanes": norm1_xanes,
+        "step_spread": step_spread,
     }
+
+
+def edge_positions(energy, norm, e0, lo=-30.0, hi=50.0, step=0.01) -> dict:
+    """Half-height and integral edge positions of normalized mu(E) (v5.2.0).
+
+    E_half: first crossing of norm = 0.5 above the start point.
+    E_int (Dau, Liebisch & Haumann, Anal. Bioanal. Chem. 376, 562 (2003)):
+        (1/(mu2-mu1)) * integral_{mu1}^{mu2} E dmu, mu1 = 0.15, mu2 = 1.0,
+        evaluated as (E2*mu2 - E1*mu1 - integral_{E1}^{E2} norm dE) / (mu2 - mu1)
+        with E1/E2 the first crossings of mu1/mu2.
+    The scan starts at the last point below 0.10 before e0 (inside e0+lo .. e0),
+    so a pre-edge peak below 0.10 cannot trigger an early crossing.
+    Returns {"e_half": float|nan, "e_int": float|nan, "reason": str};
+    a level that is never crossed gives nan with the reason (never a guess).
+    Unlike the dmu/dE maximum these two barely move between repeat scans of one
+    sample (docs/VALIDATION.md, v5.2.0), so use them to compare edge shifts.
+    """
+    nan = float("nan")
+    out = {"e_half": nan, "e_int": nan, "reason": ""}
+    try:
+        e = np.asarray(energy, dtype=float).ravel()
+        y = np.asarray(norm, dtype=float).ravel()
+        e0 = float(e0)
+    except (TypeError, ValueError):
+        out["reason"] = "invalid input"
+        return out
+    n = min(e.size, y.size)
+    e, y = e[:n], y[:n]
+    ok = np.isfinite(e) & np.isfinite(y)
+    e, y = e[ok], y[ok]
+    if e.size < 5 or not np.isfinite(e0):
+        out["reason"] = "not enough points or no E0"
+        return out
+    order = np.argsort(e)
+    e, y = e[order], y[order]
+    lo_e, hi_e = e0 + float(lo), e0 + float(hi)
+    if e[0] > e0 or e[-1] < e0:
+        out["reason"] = "E0 outside the scan"
+        return out
+    pre = np.where((e >= lo_e) & (e <= e0) & (y < 0.10))[0]
+    start = float(e[pre[-1]]) if pre.size else max(lo_e, float(e[0]))
+    stop = min(hi_e, float(e[-1]))
+    if stop - start < 2.0 * step:
+        out["reason"] = "window too short"
+        return out
+    grid = np.arange(start, stop, float(step))
+    yg = np.interp(grid, e, y)
+
+    def cross(level: float):
+        above = np.where(yg >= level)[0]
+        if above.size == 0:
+            return None
+        i = int(above[0])
+        if i == 0:
+            return float(grid[0])
+        y0, y1 = yg[i - 1], yg[i]
+        frac = 0.0 if y1 == y0 else (level - y0) / (y1 - y0)
+        return float(grid[i - 1] + frac * (grid[i] - grid[i - 1]))
+
+    e_half = cross(0.5)
+    if e_half is None:
+        out["reason"] = f"mu never reaches 0.5 within E0{lo:+g}..{hi:+g} eV"
+        return out
+    out["e_half"] = e_half
+    mu1, mu2 = 0.15, 1.0
+    e1, e2 = cross(mu1), cross(mu2)
+    if e1 is None or e2 is None:
+        out["reason"] = f"mu never reaches {mu2 if e2 is None else mu1:g} within E0{lo:+g}..{hi:+g} eV"
+        return out
+    sel = (grid >= e1) & (grid <= e2)
+    if sel.sum() < 3:
+        out["reason"] = "integration range too short"
+        return out
+    area = float(np.trapezoid(yg[sel], grid[sel])) if hasattr(np, "trapezoid") else float(np.trapz(yg[sel], grid[sel]))
+    out["e_int"] = (e2 * mu2 - e1 * mu1 - area) / (mu2 - mu1)
+    return out
 
 
 def _L():

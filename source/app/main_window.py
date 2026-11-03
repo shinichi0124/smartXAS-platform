@@ -25,6 +25,7 @@ import time
 import traceback
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -145,6 +146,7 @@ from .fit_engine import (
     model_a_preset,
     prepare_model_a_paths,
     project_paths,
+    reference_dataset_rows,
     run_feffit,
     shell_rows,
     run_feffit_multi,
@@ -157,11 +159,15 @@ from .feff_dialog import (
     QuickCheckDialog,
     CifSearchDialog,
     CopyToGroupsDialog,
+    BkgCheckResultDialog,
+    BkgCheckSettingsDialog,
     PathPickDialog,
+    ReferenceDatasetDialog,
     StructureSettingsDialog,
 )
+from . import bkg_check
 from . import ccdc_bridge
-from .fit_audit import AuditFlag, audit_fit, format_flags, verdict as audit_verdict
+from .fit_audit import AuditFlag, DEFAULT_LIMITS, audit_fit, format_flags, verdict as audit_verdict
 from .fit_search import single_phase_search, stepwise_phases
 from . import coding_registry as AGENTREG
 from . import pipeline_rules
@@ -1508,6 +1514,16 @@ class PlotCanvas(FigureCanvas):
             twin.set_xlim(ax.get_xlim())
 
     @staticmethod
+    def _plot_refined_bkg(ax, x, y):
+        """Thin green line: the background spline refined with the structure (v5.2.0).
+        Canvas text stays ASCII (invariant 12)."""
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        n = min(x.size, y.size)
+        if n > 0:
+            ax.plot(x[:n], y[:n], color="#2e9e5b", lw=0.8, label="refined bkg")
+
+    @staticmethod
     def _plot_pair(ax, x, data, fit, *, title: str, xlabel: str, ylabel: str, data_label="data", fit_label="fit"):
         """Draw an exactly comparable data/model pair on one transform grid."""
         x = np.asarray(x, dtype=float)
@@ -1543,6 +1559,8 @@ class PlotCanvas(FigureCanvas):
         ax.plot(r, re_data - offset, color="#285f9e", lw=1.05, label="Re data R (offset)")
         ax.plot(r, re_fit - offset, color="#bc6c25", lw=1.05, label="Re fit R (offset)")
         ax.plot(r, resid - offset, color="#198754", ls="--", lw=1.0, label="Re residual (offset)")
+        if view.get("bkg_rmag") is not None:
+            self._plot_refined_bkg(ax, r, np.asarray(view["bkg_rmag"], dtype=float)[:n])
         ax.axhline(0, color="#888", lw=0.6, alpha=0.6)
         ax.axhline(-offset, color="#888", lw=0.6, alpha=0.5)
         ax.set_xlim(left=0)
@@ -1604,6 +1622,8 @@ class PlotCanvas(FigureCanvas):
                 self.axes["fit_top"], view["k"], view["data_kchi"], view["fit_kchi"],
                 title="Rk: k-space", xlabel="k (Å⁻¹)", ylabel="kᵂ χ(k)",
             )
+            if view.get("bkg_kchi") is not None:
+                self._plot_refined_bkg(self.axes["fit_top"], view["k"], view["bkg_kchi"])
             self._draw_fit_rmr(self.axes["fit_bottom"], view, suffix=" (R component)")
         elif kind == "kq":
             self._plot_pair(
@@ -1791,6 +1811,8 @@ class PlotCanvas(FigureCanvas):
                 title=f"k-space (k^{kw}χ)", xlabel="k (Å⁻¹)", ylabel=f"k^{kw}χ(k)",
                 data_label="fit data", fit_label="fit model",
             )
+            if view.get("bkg_kchi") is not None:
+                self._plot_refined_bkg(axK, view["k"], view["bkg_kchi"])
         elif fit is not None and fit.ok and fit.fit_chi is not None and "k" in self.axes:
             fk = fit.fit_k if fit.fit_k is not None else fit.k
             if fk is not None:
@@ -1806,6 +1828,8 @@ class PlotCanvas(FigureCanvas):
             axR.plot(r[:n2], md[:n2], color="#202020", lw=1.3, label="fit data |R|")
             axR.plot(r[:n2], mf[:n2], color="#e64626", lw=1.3, label="fit model |R|")
             axR.plot(r[:n2], rr[:n2], color="#198754", ls="--", lw=0.95, label="Re residual")
+            if view.get("bkg_rmag") is not None:
+                self._plot_refined_bkg(axR, r, view["bkg_rmag"])
         elif fit is not None and fit.ok and fit.fit_chir_mag is not None and "R" in self.axes:
             fr = fit.fit_r if fit.fit_r is not None else (groups[0].session.arrays.r if groups else None)
             if fr is not None:
@@ -2878,7 +2902,7 @@ class MainWindow(QMainWindow):
         nv = self.box_norm.body_layout()
         self.sp_nnorm = QSpinBox()
         self.sp_nnorm.setRange(0, 3)  # larch degree; 0 = Athena nnorm 1 (constant), v4.4.2
-        self.sp_nnorm.setValue(3)
+        self.sp_nnorm.setValue(2)  # v5.2.0: matches AthenaSettings.nnorm and Auto norm
         self.sp_nnorm.setMinimumWidth(72)
         self.chk_flatten = QCheckBox()
         self.chk_flatten.setChecked(True)
@@ -2943,7 +2967,7 @@ class MainWindow(QMainWindow):
 
         self.box_ft = CollapsibleGroupBox()
         fv = self.box_ft.body_layout()
-        self.sp_kmin = _dspin(0, 15, 0.1, 3.0, 2, width=64)
+        self.sp_kmin = _dspin(0, 15, 0.1, float(FT_KMIN_DEFAULT), 2, width=64)  # v5.2.0: matches AthenaSettings.kmin
         self.sp_kmax = _dspin(0, 20, 0.1, 10.0, 2, width=64)
         self.sp_dk = _dspin(0, 5, 0.1, 1.0, 2, width=56)
         self.cmb_kwin = _combo(["Hanning", "Kaiser-Bessel", "Gaussian", "Sine", "Parzen"], width=96)
@@ -3081,6 +3105,14 @@ class MainWindow(QMainWindow):
         self.cmb_fit_plot_kw.currentIndexChanged.connect(self._fit_plot_weight_changed)
         self.fit_plot_host = _row(self.lbl_fit_plot, self.cmb_fit_plot, self.lbl_fit_plot_kw, self.cmb_fit_plot_kw)
         fw.addWidget(self.fit_plot_host)
+        # v5.2.0: background cross-checks.  The box is never persisted (every start: off).
+        self.btn_bkg_check = QPushButton()
+        self.btn_bkg_check.setObjectName("ghostBtn")
+        self.btn_bkg_check.clicked.connect(lambda *_: self._bkg_check_dialog())
+        self.chk_refine_bkg = QCheckBox()
+        self.chk_refine_bkg.setChecked(False)
+        self.fit_bkg_host = _row(self.btn_bkg_check, self.chk_refine_bkg)
+        fw.addWidget(self.fit_bkg_host)
         # (box_auto_fit is added after the Structures module: v4.11.0 order is
         # windows → structures (tick, Quick check) → Auto fit → paths → GDS)
         self._fit_layout = ff
@@ -3300,7 +3332,16 @@ class MainWindow(QMainWindow):
         self.btn_joint_fit = QPushButton()
         self.btn_joint_fit.setObjectName("ghostBtn")
         self.btn_joint_fit.clicked.connect(lambda *_: self._run_joint_fit())
-        bj.addWidget(self.btn_joint_fit)
+        # v5.2.0: S0^2 from a standard with a known N (path-level override only)
+        self.btn_joint_ref = QPushButton()
+        self.btn_joint_ref.setObjectName("ghostBtn")
+        self.btn_joint_ref.clicked.connect(lambda *_: self._joint_reference_dialog())
+        row_joint = QHBoxLayout()
+        row_joint.setContentsMargins(0, 0, 0, 0)
+        row_joint.setSpacing(4)
+        row_joint.addWidget(self.btn_joint_ref)
+        row_joint.addWidget(self.btn_joint_fit, 1)
+        bj.addLayout(row_joint)
         ff.addWidget(self.box_joint_fit)
 
         # ---- Run Fit → quality → history → demo+export row ----
@@ -3392,6 +3433,17 @@ class MainWindow(QMainWindow):
         demo_export_row.setContentsMargins(0, 0, 0, 0)
         demo_export_row.setSpacing(6)
         demo_export_row.addWidget(self.btn_fit_export_all, 1)
+        # v5.3.0: also write a one-sheet 'Paper_table' workbook (default off, remembered)
+        self.chk_fit_export_paper = QCheckBox()
+        self.chk_fit_export_paper.setChecked(
+            str(self.store.value("fit/export_paper_table", "false")).strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        self.chk_fit_export_paper.setStyleSheet("QCheckBox { font-size: 11px; spacing: 3px; }")
+        self.chk_fit_export_paper.toggled.connect(
+            lambda on: self.store.setValue("fit/export_paper_table", bool(on))
+        )
+        demo_export_row.addWidget(self.chk_fit_export_paper)
         demo_export_row.addWidget(self.btn_demo_folder)
         ff.addLayout(demo_export_row)
 
@@ -4053,6 +4105,11 @@ class MainWindow(QMainWindow):
             _lab.setToolTip(t("fit_win_from_ft_tip"))
         self.lbl_fit_plot.setText(t("fit_plot"))
         self.lbl_fit_plot_kw.setText(t("fit_plot_kw"))
+        if hasattr(self, "btn_bkg_check"):
+            self.btn_bkg_check.setText(t("btn_bkg_check"))
+            self.btn_bkg_check.setToolTip(t("bkg_check_tip"))
+            self.chk_refine_bkg.setText(t("chk_refine_bkg"))
+            self.chk_refine_bkg.setToolTip(t("refine_bkg_tip"))
         if hasattr(self, "box_auto_fit"):
             self.box_auto_fit.setTitle(t("box_auto_fit"))
         # (the Fit-page AI Assist row was merged into the top ai_check bar)
@@ -4077,6 +4134,8 @@ class MainWindow(QMainWindow):
             )
             self.btn_joint_fit.setText(t("btn_joint_fit"))
             self.btn_joint_fit.setToolTip(t("joint_fit_hint", n=len(self._joint_fit_set())))
+            self.btn_joint_ref.setText(t("btn_joint_ref"))
+            self.btn_joint_ref.setToolTip(t("joint_ref_tip"))
         self.box_fit_paths.setTitle(t("box_paths"))
         self.tbl_paths.setHorizontalHeaderLabels(
             [
@@ -4153,6 +4212,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, "btn_fit_export_all"):
             self.btn_fit_export_all.setText(t("fit_export_all"))
             self.btn_fit_export_all.setToolTip(t("fit_export_all_tip"))
+            self.chk_fit_export_paper.setText(t("fit_export_paper"))
+            self.chk_fit_export_paper.setToolTip(t("fit_export_paper_tip"))
         self.txt_fit_result.setPlaceholderText(t("fit_result_ph"))
         # tools page
         if hasattr(self, "box_tools_smooth"):
@@ -5419,6 +5480,7 @@ class MainWindow(QMainWindow):
                             "n_varys": st.get("n_varys"),
                             "cn1": shells[0]["cn"] if shells else None,
                             "cn1_err": shells[0]["cn_err"] if shells else None,
+                            "cn1_lower_bound": bool(shells[0].get("cn_lower_bound")) if shells else False,
                             "n0_1": (
                                 float((tried.get("report") or {}).get("shells", [{}])[0].get("degen"))
                                 if (tried.get("report") or {}).get("shells")
@@ -8426,7 +8488,13 @@ class MainWindow(QMainWindow):
         if hasattr(self, "txt_fit_result"):
             self._set_fit_result_text(str(snap.get("result_text") or ""))
 
-    def _build_fit_settings_from_ui(self) -> FitSettings:
+    def _refine_bkg_checked(self) -> bool:
+        box = getattr(self, "chk_refine_bkg", None)
+        return bool(box is not None and box.isChecked())
+
+    def _build_fit_settings_from_ui(self, refine: bool = False) -> FitSettings:
+        """Fit windows from the panel.  ``refine`` = honour the 'Refine bkg' box
+        (Run fit / Auto fit on the tables / joint fit only; searches never do)."""
         s = self._settings_from_controls()
         return FitSettings(
             kmin=s.kmin,
@@ -8440,6 +8508,7 @@ class MainWindow(QMainWindow):
             rwindow=s.rwindow,
             fit_space="r",
             rbkg=s.rbkg,
+            refine_bkg=bool(refine and self._refine_bkg_checked()),
         )
 
     def _ensure_fit_model_ready(self) -> bool:
@@ -8583,7 +8652,7 @@ class MainWindow(QMainWindow):
 
         gds = self._gds_from_table()
         paths = self._paths_from_table()
-        fs = self._build_fit_settings_from_ui()
+        fs = self._build_fit_settings_from_ui(refine=True)
         n_total = len(targets)
         self._progress_begin(
             self.i18n.t("progress_auto_fit_working", n=n_total),
@@ -8593,6 +8662,7 @@ class MainWindow(QMainWindow):
         n_ok = 0
         last_report = ""
         last_result: Optional[FitResult] = None
+        batch_records: list = []
         cancelled = False
         try:
             for i, g in enumerate(targets):
@@ -8654,6 +8724,7 @@ class MainWindow(QMainWindow):
                         n_ok += 1
                         last_report = result.to_text()
                         last_result = result
+                        batch_records.append({"group": g, "result": result, "dataset_index": 0})
                         try:
                             save_fit_to_history(
                                 result, gds, used_g, fs, data_desc=g.name,
@@ -8687,6 +8758,7 @@ class MainWindow(QMainWindow):
             self._set_fit_result_text(last_report)
         if last_result is not None:
             self.last_fit = last_result  # overlay the last successful batch fit
+            self._last_fit_set = list(batch_records)  # paper table: every group of this batch
         try:
             self._refresh_fit_history()
         except Exception:
@@ -8705,9 +8777,10 @@ class MainWindow(QMainWindow):
 
     # ========== Joint fit (v4.8.0) ==========
     @staticmethod
-    def _fit_settings_from_athena(s) -> FitSettings:
+    def _fit_settings_from_athena(s, refine_bkg: bool = False) -> FitSettings:
         """One dataset's FT windows from its own AthenaSettings."""
         return FitSettings(
+            refine_bkg=bool(refine_bkg),
             kmin=float(s.kmin),
             kmax=float(s.kmax),
             dk=float(s.dk),
@@ -8774,9 +8847,12 @@ class MainWindow(QMainWindow):
                     )
                 )
         self.tbl_joint.setRowCount(0)
+        ref_info = self._joint_reference_info()
         for tag, name, settings, rfac, gid in rows:
             r = self.tbl_joint.rowCount()
             self.tbl_joint.insertRow(r)
+            if ref_info and ref_info.get("dataset") == name:
+                tag = f"{tag}{t('joint_reference_mark')}"
 
             def _num(key, default=float("nan")):
                 try:
@@ -8839,6 +8915,8 @@ class MainWindow(QMainWindow):
                 plot_views=dict(row.get("plot_views") or {}),
                 joint=True,
                 datasets=list(result.datasets or []),
+                gds_used=list(getattr(result, "gds_used", None) or []),
+                reference=getattr(result, "reference", None),
             )
             stats = dict(view.statistics)
             stats["dataset_r_factor"] = row.get("r_factor")
@@ -8847,6 +8925,213 @@ class MainWindow(QMainWindow):
             view.statistics = stats
             return view
         return None
+
+    # ========== Background check (v5.2.0) ==========
+    def _bkg_check_dialog(self) -> None:
+        """'Bkg check…': rbkg scan / refined background / synthetic recovery for the
+        CURRENT group and model.  Read-only: the group, its settings, the path and
+        GDS tables are never changed (bkg_check works on copies)."""
+        t = self.i18n.t
+        g = self.project.current
+        if g is None or g.energy is None or g.mu is None:
+            QMessageBox.information(self, t("bkg_check_title"), t("bkg_check_need_group"))
+            return
+        if self.box_joint_fit.isExpanded() and len(self._joint_fit_set()) >= 2:
+            QMessageBox.information(self, t("bkg_check_title"), t("bkg_check_single_only"))
+            return
+        if self._worker_is_running():
+            return
+        # read-only: never load a preset or run FEFF here (_ensure_fit_model_ready would)
+        gds = self._gds_from_table()
+        used, _kind = self._paths_for_group(g, self._paths_from_table())
+        if not gds or not used:
+            QMessageBox.information(self, t("bkg_check_title"), t("no_usable_paths"))
+            return
+        missing = [p.feff_file for p in used if not Path(p.feff_file).is_file()]
+        if missing:
+            QMessageBox.information(self, t("bkg_check_title"), t("feff_missing", f="\n".join(missing)))
+            return
+        fs = self._build_fit_settings_from_ui()  # searches/checks never refine
+        src = SimpleNamespace(
+            energy=g.energy, mu=g.mu, energy_shift=g.energy_shift, name=g.name, path=g.path,
+            settings=deepcopy(self._settings_from_controls()),
+        )
+        own = float(getattr(src.settings, "rbkg", 1.0) or 1.0)
+        dlg = BkgCheckSettingsDialog(
+            self, t=t, bi=self._bi,
+            rbkg_default=", ".join(f"{v:g}" for v in bkg_check.DEFAULT_RBKG_LIST),
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        values = dlg.values()
+        result = self._run_bkg_check(src, fs, used, gds, own, values)
+        if result is None:
+            return
+        BkgCheckResultDialog(
+            self, t=t, bi=self._bi, lang=self.i18n.lang, result=result,
+            save=lambda: self._save_bkg_check(g.name, result),
+        ).exec()
+
+    def _run_bkg_check(self, src, fs, paths, gds, own: float, values: dict):
+        """Runs the three checks item by item on the busy worker; None = cancelled/failed."""
+        t = self.i18n.t
+        self._progress_begin(t("bkg_check_title"), sliding=True, window_title=t("bkg_check_title"))
+
+        def cancelled() -> bool:
+            dlg = getattr(self, "_load_progress", None)
+            try:
+                return bool(dlg is not None and dlg.wasCanceled())
+            except Exception:
+                return False
+
+        out: dict = {}
+        self._worker_busy = True  # larch is not thread-safe: pause auto-reprocess
+        try:
+            def base_job():
+                grp, _arr = bkg_check.process_copy(src, own)
+                return run_feffit(grp, list(gds), list(paths), fs)
+
+            base = self._run_with_busy(base_job, src.name, t("bkg_check_title"))
+            if not isinstance(base, FitResult) or not base.ok:
+                QMessageBox.warning(
+                    self, t("bkg_check_title"),
+                    t("bkg_check_base_failed", msg=str(getattr(base, "message", ""))[:300]),
+                )
+                return None
+            if values.get("scan"):
+                rows = []
+                lst = list(values["rbkg_list"])
+                for i, v in enumerate(lst):
+                    if cancelled():
+                        break
+                    rows += self._run_with_busy(
+                        lambda v=v: bkg_check.rbkg_scan(src, fs, paths, gds, rbkg_list=(v,)),
+                        src.name, t("bkg_check_progress_scan", v=v, i=i + 1, n=len(lst)),
+                    )
+                out["scan"] = rows
+            if values.get("refine") and not cancelled():
+                out["refine"] = self._run_with_busy(
+                    lambda: bkg_check.refine_compare(src, fs, paths, gds),
+                    src.name, t("bkg_check_progress_refine"),
+                )
+            if values.get("synth"):
+                rows = []
+                others = [v for v in values["rbkg_list"] if abs(v - own) > 1e-9]
+                lst = [own] + ([max(others)] if others else [])
+                for i, v in enumerate(lst):
+                    if cancelled():
+                        break
+                    rows += self._run_with_busy(
+                        lambda v=v: bkg_check.synthetic_recovery(src, fs, paths, gds, base, rbkg_list=(v,)),
+                        src.name, t("bkg_check_progress_synth", v=v, i=i + 1, n=len(lst)),
+                    )
+                out["synth"] = rows
+            out["leak"] = self._run_with_busy(
+                lambda: bkg_check.first_shell_leakage(base, fs), src.name, t("bkg_check_title")
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, t("bkg_check_title"), str(exc)[:400])
+            return None
+        finally:
+            self._worker_busy = False
+            self._progress_end()
+        out["conclusion"] = bkg_check.conclusion(
+            out.get("scan") or [], own, out.get("synth") or [], out.get("leak")
+        )
+        parts = []
+        for key, title in (("scan", "rbkg scan"), ("refine", "refined background"), ("synth", "synthetic recovery")):
+            if key in out:
+                parts.append(bkg_check.rows_to_text(title, out[key]))
+        leak = out.get("leak") or {}
+        if leak.get("ok"):
+            parts.append(
+                f"first-shell |chi(R)|^2 below 1.0 A: {leak['below_1_0']:.3f}; below 1.2 A: {leak['below_1_2']:.3f}"
+            )
+        parts.extend(out["conclusion"]["en"])
+        out["text"] = "\n\n".join(parts)
+        out["csv"] = bkg_check.results_to_csv({k: out[k] for k in ("scan", "refine", "synth") if k in out})
+        return out
+
+    def _save_bkg_check(self, name: str, result: dict) -> Path:
+        """output/bkg_check_<group>_<stamp>.txt and .csv"""
+        import datetime
+
+        from .fit_engine import DEFAULT_OUTPUT
+
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name)).strip("_") or "group"
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        folder = Path(DEFAULT_OUTPUT)
+        folder.mkdir(parents=True, exist_ok=True)
+        base = folder / f"bkg_check_{safe}_{stamp}"
+        base.with_suffix(".txt").write_text(str(result.get("text", "")) + "\n", encoding="utf-8")
+        base.with_suffix(".csv").write_text(str(result.get("csv", "")), encoding="utf-8")
+        return base.with_suffix(".txt")
+
+    def _joint_reference_info(self) -> Optional[dict]:
+        """The S0^2 reference standard defined by the tables, else None (v5.2.0).
+
+        Derived, never stored: a dedicated path row (Data = a dataset) whose
+        amplitude is ``<s02 row>*<literal N>`` with that S0^2 row a guess."""
+        import re as _re
+
+        gds = {g.name.strip(): g for g in self._gds_from_table()}
+        pat = _re.compile(r"\s*([A-Za-z_]\w*)\s*\*\s*([0-9]*\.?[0-9]+(?:[eE][-+]?\d+)?)\s*")
+        for p in self._paths_from_table():
+            data = str(p.data or "").strip()
+            if not data or not p.use:
+                continue
+            m = pat.fullmatch(str(p.s02 or ""))
+            if (
+                m
+                and m.group(1).lower().startswith("s02")
+                and m.group(1) in gds
+                and gds[m.group(1)].kind == "vary"
+            ):
+                return {"dataset": data, "path": str(p.label), "n": float(m.group(2))}
+        return None
+
+    def _joint_reference_dialog(self) -> None:
+        """'Reference…': one dataset's first-shell N is fixed at its known value and
+        S0^2 becomes a guess shared by all datasets (one undo step)."""
+        t = self.i18n.t
+        names = [g.name for g in self._joint_fit_set()]
+        paths = self._paths_from_table()
+        rows = [
+            (p.label, p.feff_file)
+            for p in paths
+            if p.use and p.feff_file and not str(p.data or "").strip()
+        ]
+        if not names:
+            QMessageBox.information(self, t("box_joint_fit"), t("joint_ref_need_one"))
+            return
+        if not rows:
+            QMessageBox.information(self, t("box_joint_fit"), t("no_usable_paths"))
+            return
+        dlg = ReferenceDatasetDialog(self, t=t, bi=self._bi, datasets=names, path_rows=rows)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        v = dlg.values()
+        try:
+            new_paths, new_gds = reference_dataset_rows(
+                paths, self._gds_from_table(), v["dataset"], v["path_label"], v["n_known"],
+                v["s02_value"], v["s02_min"], v["s02_max"],
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, t("joint_ref_title"), str(exc))
+            return
+        self._push_module_undo("auto_fit", [], fit_ui=self._snapshot_fit_ui())
+        self.tbl_gds.setRowCount(0)
+        for g in new_gds:
+            self._gds_add_row(g)
+        self.tbl_paths.setRowCount(0)
+        for pd in new_paths:
+            self._paths_add_row(pd)
+        self._log(
+            f"reference standard: {v['dataset']} / {v['path_label']} N = {v['n_known']:g} fixed; "
+            "S0^2 is a guess"
+        )
+        self._refresh_fit_panel()
+        self._refresh_joint_table()
 
     def _run_joint_fit(self) -> None:
         if self._worker_is_running():
@@ -8906,7 +9191,9 @@ class MainWindow(QMainWindow):
                     name=g.name,
                     tag=tag,
                     group=g.session.snapshot_group_for_fit(),
-                    settings=self._fit_settings_from_athena(g.settings),
+                    settings=self._fit_settings_from_athena(
+                        g.settings, refine_bkg=self._refine_bkg_checked()
+                    ),
                     paths=used,
                 )
             )
@@ -8928,11 +9215,14 @@ class MainWindow(QMainWindow):
         def job():
             return run_feffit_multi(datasets, gds)
 
+        reference_info = self._joint_reference_info()
+
         def _done(result):
             self.worker = None
             if isinstance(result, FitResult) and result.ok:
                 self._joint_group_objs = group_objs
                 self._joint_group_ids = group_ids
+                result.reference = reference_info
             # the snapshot keeps the table as it was (every row once, unticked
             # rows too), not the per-dataset path lists concatenated
             self._joint_fit_done(result, gds, paths, base_settings, data_desc, prepared)
@@ -9211,6 +9501,8 @@ class MainWindow(QMainWindow):
             )
             if row["cn_fixed"]:
                 cn += " " + self.i18n.t("cn_fixed_mark")
+            if row.get("cn_lower_bound"):
+                cn += " " + self.i18n.t("cn_lower_bound_mark")
             parts.append(f"{row['label']}: CN {cn}, R {row['r']:.3f} Å")
         return "; ".join(parts)
 
@@ -13963,7 +14255,7 @@ class MainWindow(QMainWindow):
             # v4.7.0: only the paths assigned to THIS group's element.  The old
             # re-read took every ticked path, so a Ni fit also counted Fe paths.
             used, _match_kind = self._paths_for_group(g, paths)
-        fs = self._build_fit_settings_from_ui()
+        fs = self._build_fit_settings_from_ui(refine=True)
 
         self._log(self._bi(f"拟合 {g.name}（{len(used)} 条路径）…", f"Fitting {g.name} ({len(used)} paths)…"))
         self._set_fit_result_text(self._bi("拟合运行中…", "Running fit…"))
@@ -14625,6 +14917,13 @@ class MainWindow(QMainWindow):
         report_path = out_dir / f"fit_report_{name}_{ts}.txt"
         report_path.write_text(res.to_text(), encoding="utf-8")
         written.append(report_path)
+        # v5.3.0: optional one-sheet Paper_table workbook; a failure is reported, never silent,
+        # and never stops the other files
+        paper_note = ""
+        if self._export_paper_wanted():
+            paper_path, paper_note = self._export_paper_table(out_dir, name, ts)
+            if paper_path is not None:
+                written.append(paper_path)
 
         kw = int(self.sp_kw_plot.value()) if hasattr(self, "sp_kw_plot") else 2
         if getattr(res, "joint", False) and getattr(res, "datasets", None):
@@ -14638,7 +14937,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 self.i18n.t("fit_export_all"),
-                self._bi(f"已导出：{names}", f"Exported:{chr(10)}{names}"),
+                self._bi(f"已导出：{names}", f"Exported:{chr(10)}{names}") + paper_note,
             )
             return
         view = res.plot_views.get(kw) if getattr(res, "plot_views", None) else None
@@ -14707,8 +15006,116 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             self.i18n.t("fit_export_all"),
-            self._bi(f"已导出：\n{names}", f"Exported:\n{names}"),
+            self._bi(f"已导出：\n{names}", f"Exported:\n{names}") + paper_note,
         )
+
+    # ---- paper table (v5.3.0) ----
+    def _export_paper_wanted(self) -> bool:
+        box = getattr(self, "chk_fit_export_paper", None)
+        return bool(box is not None and box.isChecked())
+
+    def _remember_fit_set(self, result: FitResult) -> None:
+        """Keep every (group, result, dataset) of the latest fit action for the paper table.
+
+        Run fit = one record; a joint fit = one record per dataset (same FitResult)."""
+        records: list = []
+        if isinstance(result, FitResult) and result.ok:
+            if getattr(result, "joint", False) and getattr(result, "datasets", None):
+                ids = list(getattr(self, "_joint_group_ids", []) or [])
+                by_id = {g.id: g for g in self.project.groups}
+                if len(ids) == len(result.datasets):
+                    for i, gid in enumerate(ids):
+                        if gid in by_id:
+                            records.append({"group": by_id[gid], "result": result, "dataset_index": i})
+            elif self.project.current is not None:
+                idx = 0 if getattr(result, "datasets", None) else None
+                records.append({"group": self.project.current, "result": result, "dataset_index": idx})
+        self._last_fit_set = records
+
+    @staticmethod
+    def _same_fit(a, b) -> bool:
+        """True when *a* and *b* are the same fit (a joint view shares the dataset dicts)."""
+        if a is b:
+            return True
+        da, db = getattr(a, "datasets", None), getattr(b, "datasets", None)
+        return bool(da and db and da[0] is db[0])
+
+    def _paper_entries(self, res: FitResult) -> list:
+        """Entries for ``fit_engine.paper_table_blocks``: the whole latest fit action while
+        ``last_fit`` still belongs to it, else just the current group with ``last_fit``."""
+        fit_set = list(getattr(self, "_last_fit_set", None) or [])
+        records = fit_set if any(self._same_fit(res, r["result"]) for r in fit_set) else []
+        if not records:
+            g = self.project.current
+            idx = None
+            dsets = list(getattr(res, "datasets", None) or [])
+            if dsets:
+                names = [str((d or {}).get("name", "")) for d in dsets]
+                want = str((res.statistics or {}).get("dataset_name") or getattr(g, "name", ""))
+                idx = names.index(want) if want in names else (0 if len(dsets) == 1 else None)
+            records = [{"group": g, "result": res, "dataset_index": idx}] if g is not None else []
+        entries = []
+        for rec in records:
+            g, r, idx = rec["group"], rec["result"], rec.get("dataset_index")
+            ds = (r.datasets[idx] if idx is not None and getattr(r, "datasets", None) else {}) or {}
+            st = ds.get("settings") or {}
+            gs = getattr(g, "settings", None)
+
+            def pick(key, default):
+                if st.get(key) is not None:
+                    return st.get(key)
+                return getattr(gs, key, default) if gs is not None else default
+
+            e0 = None
+            try:
+                e0 = float(g.session.arrays.e0)
+            except Exception:
+                e0 = None
+            kw_list = st.get("kw_list") or (1, 2, 3)
+            entries.append(
+                {
+                    "sample": str(g.name),
+                    "element": str(getattr(g, "element", "") or ""),
+                    "edge": str(getattr(g, "edge", "") or ""),
+                    "e0": e0,
+                    "kmin": float(pick("kmin", 2.0)),
+                    "kmax": float(pick("kmax", 10.0)),
+                    "rmin": float(pick("rmin", 1.0)),
+                    "rmax": float(pick("rmax", 4.0)),
+                    "kweights": tuple(int(k) for k in kw_list),
+                    "window": str(pick("kwindow", "hanning")),
+                    "dk": float(pick("dk", 1.0)),
+                    "result": r,
+                    "dataset_index": idx,
+                }
+            )
+        return entries
+
+    def _export_paper_table(self, out_dir: Path, name: str, ts: str):
+        """Write paper_table_<name>_<ts>.xlsx.  Returns (path or None, note for the message box)."""
+        t = self.i18n.t
+
+        def failed(why: str):
+            self._log(self._bi("论文表没有导出：", "Paper table not exported: ") + why)
+            return None, "\n" + t("paper_table_failed", why=why)
+
+        try:
+            import openpyxl  # noqa: F401
+        except ImportError:
+            return failed(t("paper_table_no_openpyxl"))
+        try:
+            from . import paper_table as PT
+            from .fit_engine import paper_table_blocks
+
+            blocks, notes = paper_table_blocks(self._paper_entries(self.last_fit))
+            if not any(b.get("rows") for b in blocks):
+                return failed(t("paper_table_nothing"))
+            limit = float(DEFAULT_LIMITS["cn_rel_err"]["warn"])
+            path = out_dir / f"paper_table_{name}_{ts}.xlsx"
+            PT.write_xlsx(str(path), blocks, notes, intro=t("paper_table_intro"), cn_rel_err_limit=limit)
+            return path, ""
+        except Exception as exc:
+            return failed(str(exc)[:300])
 
     def _export_joint_datasets(self, res, out_dir: Path, ts: str, kw: int) -> List[Path]:
         """Per-dataset k/R CSVs plus the dataset summary table (v4.8.0)."""
@@ -14792,6 +15199,7 @@ class MainWindow(QMainWindow):
     def _fit_done(self, result: FitResult):
         self._worker_busy = False
         self.last_fit = result
+        self._remember_fit_set(result)
         report = result.to_text()
         self._log(report[:2000])
         self._set_fit_result_text(report)

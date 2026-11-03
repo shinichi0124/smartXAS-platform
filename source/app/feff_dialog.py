@@ -613,6 +613,290 @@ class CopyToGroupsDialog(QDialog):
         return [n for n in out if n]
 
 
+class ReferenceDatasetDialog(QDialog):
+    """Pick the S0^2 reference standard of a joint fit (v5.2.0).
+
+    ``datasets``: group names of the fit set.  ``path_rows``: [(label, feff_file)]
+    of the 'All' rows; the default is the row with the smallest Reff.
+    """
+
+    def __init__(self, parent, *, t: Callable, bi: Callable, datasets: Sequence[str],
+                 path_rows: Sequence[tuple]):
+        super().__init__(parent)
+        self._t = t
+        self.setWindowTitle(t("joint_ref_title"))
+        self.resize(360, 250)
+        root = QVBoxLayout(self)
+        hint = QLabel(t("joint_ref_tip"))
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#6b625d; font-size:11px;")
+        root.addWidget(hint)
+        form = QFormLayout()
+        self.cmb_dataset = QComboBox()
+        for name in datasets:
+            self.cmb_dataset.addItem(str(name), str(name))
+        self.cmb_path = QComboBox()
+        best, best_r = 0, float("inf")
+        for i, (label, feff_file) in enumerate(path_rows):
+            self.cmb_path.addItem(str(label), str(label))
+            try:
+                from .fit_engine import _parse_feff_dat_header
+
+                r = float(_parse_feff_dat_header(Path(feff_file)).get("reff", float("nan")))
+            except Exception:
+                r = float("nan")
+            if math.isfinite(r) and r < best_r:
+                best, best_r = i, r
+        if self.cmb_path.count():
+            self.cmb_path.setCurrentIndex(best)
+        self.sp_n = QDoubleSpinBox()
+        self.sp_n.setRange(0.5, 24.0)
+        self.sp_n.setDecimals(2)
+        self.sp_n.setSingleStep(0.5)
+        self.sp_n.setValue(6.0)
+        self.sp_s02 = QDoubleSpinBox()
+        self.sp_s02_min = QDoubleSpinBox()
+        self.sp_s02_max = QDoubleSpinBox()
+        for sp, val in ((self.sp_s02, 0.6), (self.sp_s02_min, 0.3), (self.sp_s02_max, 1.2)):
+            sp.setRange(0.05, 3.0)
+            sp.setDecimals(3)
+            sp.setSingleStep(0.05)
+            sp.setValue(val)
+        form.addRow(t("joint_ref_dataset"), self.cmb_dataset)
+        form.addRow(t("joint_ref_path"), self.cmb_path)
+        form.addRow(t("joint_ref_n"), self.sp_n)
+        form.addRow(t("joint_ref_s02"), self.sp_s02)
+        form.addRow(t("joint_ref_s02_min"), self.sp_s02_min)
+        form.addRow(t("joint_ref_s02_max"), self.sp_s02_max)
+        root.addLayout(form)
+        row = QHBoxLayout()
+        self.btn_ok = QPushButton(bi("确定", "OK"))
+        self.btn_cancel = QPushButton(bi("取消", "Cancel"))
+        self.btn_ok.clicked.connect(self.accept)
+        self.btn_cancel.clicked.connect(self.reject)
+        row.addStretch(1)
+        row.addWidget(self.btn_ok)
+        row.addWidget(self.btn_cancel)
+        root.addLayout(row)
+
+    def values(self) -> dict:
+        return {
+            "dataset": str(self.cmb_dataset.currentData() or ""),
+            "path_label": str(self.cmb_path.currentData() or ""),
+            "n_known": float(self.sp_n.value()),
+            "s02_value": float(self.sp_s02.value()),
+            "s02_min": float(self.sp_s02_min.value()),
+            "s02_max": float(self.sp_s02_max.value()),
+        }
+
+
+class BkgCheckSettingsDialog(QDialog):
+    """What the background check should run (v5.2.0)."""
+
+    def __init__(self, parent, *, t: Callable, bi: Callable, rbkg_default: str):
+        super().__init__(parent)
+        self.setWindowTitle(t("bkg_check_title"))
+        self.resize(360, 190)
+        root = QVBoxLayout(self)
+        form = QFormLayout()
+        self.ed_rbkg = QLineEdit(rbkg_default)
+        self.ed_rbkg.setToolTip(t("bkg_check_rbkg_tip"))
+        form.addRow(t("bkg_check_rbkg_list"), self.ed_rbkg)
+        root.addLayout(form)
+        self.chk_scan = QCheckBox(t("bkg_check_part_scan"))
+        self.chk_refine = QCheckBox(t("bkg_check_part_refine"))
+        self.chk_synth = QCheckBox(t("bkg_check_part_synth"))
+        for chk in (self.chk_scan, self.chk_refine, self.chk_synth):
+            chk.setChecked(True)
+            root.addWidget(chk)
+        row = QHBoxLayout()
+        self.btn_ok = QPushButton(bi("运行", "Run"))
+        self.btn_cancel = QPushButton(bi("取消", "Cancel"))
+        self.btn_ok.clicked.connect(self._accept_checked)
+        self.btn_cancel.clicked.connect(self.reject)
+        row.addStretch(1)
+        row.addWidget(self.btn_ok)
+        row.addWidget(self.btn_cancel)
+        root.addLayout(row)
+        self._t = t
+
+    def _accept_checked(self) -> None:
+        if not self.rbkg_list():
+            QMessageBox.information(self, self._t("bkg_check_title"), self._t("bkg_check_rbkg_bad"))
+            return
+        self.accept()
+
+    def rbkg_list(self) -> List[float]:
+        out: List[float] = []
+        for part in self.ed_rbkg.text().replace("，", ",").replace(";", ",").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                v = float(part)
+            except ValueError:
+                return []
+            if not (0.2 <= v <= 3.0):
+                return []
+            out.append(v)
+        return out
+
+    def values(self) -> dict:
+        return {
+            "rbkg_list": self.rbkg_list(),
+            "scan": self.chk_scan.isChecked(),
+            "refine": self.chk_refine.isChecked(),
+            "synth": self.chk_synth.isChecked(),
+        }
+
+
+class BkgCheckResultDialog(QDialog):
+    """Three tables + leakage + a plain conclusion; copy / save (v5.2.0).
+
+    ``result`` keys: scan, refine, synth (row lists), leak (dict), conclusion
+    ({'zh','en'} lists), text (ASCII report), csv.  ``save`` is a callable
+    returning the written path (or raising)."""
+
+    COLS = ("bkg_check_col_rbkg", "bkg_check_col_rmin", "bkg_check_col_n", "bkg_check_col_r",
+            "bkg_check_col_ss", "bkg_check_col_rf", "bkg_check_col_vars", "bkg_check_col_audit",
+            "bkg_check_col_note")
+
+    def __init__(self, parent, *, t: Callable, bi: Callable, lang: str, result: dict,
+                 save: Optional[Callable] = None):
+        super().__init__(parent)
+        self._t = t
+        self._result = result
+        self._save = save
+        self.setWindowTitle(t("bkg_check_title"))
+        self.resize(800, 660)
+        outer = QVBoxLayout(self)
+        # the content scrolls vertically as a whole; no table or the dialog scrolls sideways
+        from PySide6.QtWidgets import QScrollArea
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body = QWidget()
+        root = QVBoxLayout(body)
+        root.setContentsMargins(0, 0, 4, 0)
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
+        self.tables: Dict[str, QTableWidget] = {}
+        for key, title in (("scan", "bkg_check_sec_scan"), ("refine", "bkg_check_sec_refine"),
+                           ("synth", "bkg_check_sec_synth")):
+            rows = result.get(key)
+            if rows is None:
+                continue
+            lab = QLabel(t(title))
+            lab.setStyleSheet("font-weight:600;")
+            root.addWidget(lab)
+            tbl = self._make_table(rows, key)
+            self.tables[key] = tbl
+            root.addWidget(tbl)
+        leak = result.get("leak") or {}
+        self.lbl_leak = QLabel()
+        if leak.get("ok"):
+            self.lbl_leak.setText(t("bkg_check_leak", a=leak["below_1_0"], b=leak["below_1_2"]))
+        elif leak:
+            self.lbl_leak.setText(t("bkg_check_leak_na", why=str(leak.get("reason", ""))))
+        self.lbl_leak.setWordWrap(True)
+        root.addWidget(self.lbl_leak)
+        concl = (result.get("conclusion") or {}).get("zh" if str(lang).startswith("zh") else "en") or []
+        self.lbl_conclusion = QLabel("\n".join("• " + c for c in concl))
+        self.lbl_conclusion.setWordWrap(True)
+        self.lbl_conclusion.setStyleSheet("padding:4px 0;")
+        root.addWidget(self.lbl_conclusion)
+        row = QHBoxLayout()
+        self.btn_copy = QPushButton(t("bkg_check_copy"))
+        self.btn_save = QPushButton(t("bkg_check_save"))
+        self.btn_close = QPushButton(bi("关闭", "Close"))
+        self.btn_copy.clicked.connect(self._copy)
+        self.btn_save.clicked.connect(self._do_save)
+        self.btn_close.clicked.connect(self.accept)
+        root.addStretch(1)
+        row.addWidget(self.btn_copy)
+        row.addWidget(self.btn_save)
+        row.addStretch(1)
+        row.addWidget(self.btn_close)
+        outer.addLayout(row)
+
+    def _make_table(self, rows, key: str) -> QTableWidget:
+        t = self._t
+        tbl = QTableWidget(len(rows), len(self.COLS))
+        tbl.setHorizontalHeaderLabels([t(c) for c in self.COLS])
+        tbl.verticalHeader().setVisible(False)
+        tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        tbl.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        tbl.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        hdr = tbl.horizontalHeader()
+        for c in range(len(self.COLS) - 1):
+            hdr.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(len(self.COLS) - 1, QHeaderView.ResizeMode.Stretch)
+
+        def num(v, fmt):
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return "—"
+            return fmt.format(v) if math.isfinite(v) else "—"
+
+        for i, r in enumerate(rows):
+            s = r.get("first_shell") or {}
+            if r.get("mode") == "plain":
+                head = t("bkg_check_plain")
+            else:
+                head = num(r.get("rbkg"), "{:g}") + (
+                    f" ({t('bkg_check_nodes', n=r['nodes'])})" if key == "refine" and r.get("nodes") else ""
+                )
+            if not r.get("ok"):
+                cells = [head, "—", "—", "—", "—", "—", "—", "—", str(r.get("reason", ""))]
+            elif r.get("same_as") is not None:
+                cells = [head, "—", "—", "—", "—", "—", "—", "—", t("bkg_check_same_nodes")]
+            else:
+                cn, ce = s.get("cn"), s.get("cn_err")
+                ntxt = num(cn, "{:.2f}")
+                if ntxt != "—" and ce == ce and isinstance(ce, (int, float)) and ce > 0:
+                    ntxt += f" ± {ce:.2f}"
+                note = []
+                if "first_shell_ratio" in r:
+                    note.append(t("bkg_check_ratio", v=r["first_shell_ratio"]))
+                if "spline_ratio" in r:
+                    note.append(t("bkg_check_spline", v=r["spline_ratio"], r=r["spline_peak_r"]))
+                if r.get("suspect_minimum"):
+                    note.append(t("bkg_check_suspect"))
+                nvar, nidp = r.get("n_varys"), r.get("n_idp")
+                cells = [
+                    head, num(r.get("rmin"), "{:.2f}"), ntxt, num(s.get("r"), "{:.4f}"),
+                    num(s.get("sigma2"), "{:.5f}"), num(r.get("r_factor"), "{:.5f}"),
+                    f"{nvar}/{num(nidp, '{:.1f}')}", str(r.get("verdict", "")), "; ".join(note),
+                ]
+            for c, text in enumerate(cells):
+                tbl.setItem(i, c, QTableWidgetItem(text))
+        # exact height: every row visible, so there is no scroll bar inside the table
+        tbl.resizeRowsToContents()
+        height = tbl.horizontalHeader().height() + 2 * tbl.frameWidth() + 2
+        height += sum(tbl.rowHeight(i) for i in range(tbl.rowCount()))
+        tbl.setFixedHeight(max(height, 40))
+        return tbl
+
+    def _copy(self) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        QApplication.clipboard().setText(str(self._result.get("text", "")))
+
+    def _do_save(self) -> None:
+        if self._save is None:
+            return
+        try:
+            path = self._save()
+        except Exception as exc:  # shown, never swallowed
+            QMessageBox.warning(self, self._t("bkg_check_title"), str(exc))
+            return
+        QMessageBox.information(self, self._t("bkg_check_title"), self._t("bkg_check_saved", path=str(path)))
+
+
 class CifSearchDialog(QDialog, _MarkTableMixin):
     """Search CIFs from one source picked in a dropdown (v4.11.0): the offline
     library (zip / folder / CSD pack), the AMCSD bundled with larch, the CSD
@@ -1524,6 +1808,8 @@ class QuickCheckDialog(QDialog):
             cn += f" ± {float(cn_err):.1f}"
         if cn != "—" and isinstance(row.get("n0_1"), (int, float)):
             cn += f" ({float(row['n0_1']):g})"
+        if cn != "—" and row.get("cn1_lower_bound"):
+            cn += " " + t("cn_lower_bound_mark")
         values = [
             str(row.get("label", "")),
             self._num(row.get("redchi"), "{:.4g}"),

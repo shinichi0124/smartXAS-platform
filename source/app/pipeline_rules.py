@@ -97,6 +97,11 @@ def _f(value: Any) -> Optional[float]:
     return out if np.isfinite(out) else None
 
 
+def _round_or_none(value: Any, digits: int) -> Optional[float]:
+    v = _f(value)
+    return None if v is None else round(v, digits)
+
+
 def _sorted_xy(energy: Any, mu: Any) -> Tuple[np.ndarray, np.ndarray]:
     e = np.asarray(energy, dtype=float).ravel()
     m = np.asarray(mu, dtype=float).ravel()
@@ -961,6 +966,8 @@ def retry_windows(energy: Any, mu: Any, e0: float) -> List[Dict[str, Any]]:
        reference choice for MEX1 long, strongly curved pre-edges.
     ② scan start + 3 eV → E0 − 20 eV, linear (nvict 0):  the reference choice
        for benchtop scans whose 1s→3d peak sits at E0−8.
+    Both use a quadratic post-edge (nnorm 2) since v5.2.0: a cubic over a long
+    window lowers the edge step by 3–4 % (docs/VALIDATION.md, v5.2.0).
     """
     e = np.asarray(energy, dtype=float).ravel()
     e = e[np.isfinite(e)]
@@ -974,14 +981,14 @@ def retry_windows(energy: Any, mu: Any, e0: float) -> List[Dict[str, Any]]:
     if r1 < -10.0:
         out.append({
             "label": "retry1",
-            "pre1": r1, "pre2": -30.0, "nvict": 3, "nnorm": 3,
+            "pre1": r1, "pre2": -30.0, "nvict": 3, "nnorm": 2,
             "reason_zh": f"试 ① 预边 {r1:.0f}…−30 eV（Victoreen nvict 3）",
             "reason_en": f"Try (1) pre-edge {r1:.0f}…−30 eV (Victoreen nvict 3)",
         })
     if r2 < -10.0 and abs(r2 - r1) > 1.0:
         out.append({
             "label": "retry2",
-            "pre1": r2, "pre2": -20.0, "nvict": 0, "nnorm": 3,
+            "pre1": r2, "pre2": -20.0, "nvict": 0, "nnorm": 2,
             "reason_zh": f"试 ② 预边 {r2:.0f}…−20 eV（线性 nvict 0）",
             "reason_en": f"Try (2) pre-edge {r2:.0f}…−20 eV (linear nvict 0)",
         })
@@ -1004,6 +1011,13 @@ class ProcessingEntry:
     dE_basis: str = ""
     e0: Optional[float] = None
     edge_step: Optional[float] = None
+    # v5.2.0: half-height and integral edge positions of the normalized mu (compare
+    # edge shifts with these, not with E0 / the dmu/dE maximum, which jitters)
+    e_half: Optional[float] = None
+    e_int: Optional[float] = None
+    # v5.3.0: (max - min)/median of the edge step over post-edge starts 50-150 eV
+    # (athena_ops.edge_step_scan); EXAFS wiggles make the step move by this much
+    step_spread: Optional[float] = None
     pre: str = ""
     norm: str = ""
     nnorm: Optional[int] = None
@@ -1027,6 +1041,9 @@ class ProcessingEntry:
             "dE_basis": self.dE_basis,
             "E0_eV": None if self.e0 is None else round(float(self.e0), 2),
             "edge_step": None if self.edge_step is None else round(float(self.edge_step), 4),
+            "E_half_eV": _round_or_none(self.e_half, 2),
+            "E_int_eV": _round_or_none(self.e_int, 2),
+            "edge_step_spread_pct": None if self.step_spread is None else round(100.0 * float(self.step_spread), 1),
             "pre_eV": self.pre,
             "norm_eV": self.norm,
             "nnorm": self.nnorm,
@@ -1119,6 +1136,10 @@ class ProcessingRecord:
                 dE_basis=str(row.get("dE_basis") or ""),
                 e0=_f(row.get("E0_eV")),
                 edge_step=_f(row.get("edge_step")),
+                e_half=_f(row.get("E_half_eV")),
+                e_int=_f(row.get("E_int_eV")),
+                step_spread=(None if _f(row.get("edge_step_spread_pct")) is None
+                             else _f(row.get("edge_step_spread_pct")) / 100.0),
                 pre=str(row.get("pre_eV") or ""),
                 norm=str(row.get("norm_eV") or ""),
                 nnorm=row.get("nnorm"),
@@ -1153,6 +1174,27 @@ def describe_group(group: Any, *, note: str = "") -> ProcessingEntry:
         n_points=int(e.size) if e.size else None,
         warn=str(note or getattr(group, "note", "") or ""),
     )
+    # v5.2.0 half-height / integral edge positions (nan -> empty cell, never a guess)
+    if arrs is not None and e0 is not None:
+        try:
+            pos = athena_ops.edge_positions(
+                getattr(arrs, "energy", None), getattr(arrs, "norm", None), e0
+            )
+            entry.e_half = _f(pos.get("e_half"))
+            entry.e_int = _f(pos.get("e_int"))
+        except Exception:
+            pass
+    # v5.3.0 edge-step spread over post-edge starts (too short a post-edge -> empty cell)
+    if arrs is not None and e0 is not None and s is not None:
+        try:
+            scan = athena_ops.edge_step_scan(
+                getattr(arrs, "energy", None), getattr(arrs, "mu", None), e0,
+                float(s.pre1), float(s.pre2), int(getattr(s, "nvict", 0) or 0), float(s.norm2),
+                nnorm=int(getattr(s, "nnorm", 2) or 2),
+            )
+            entry.step_spread = athena_ops.norm1_by_median_step(scan)[1]
+        except Exception:
+            pass
     if s is not None:
         pre1 = _f(getattr(s, "pre1", None))
         pre2 = _f(getattr(s, "pre2", None))

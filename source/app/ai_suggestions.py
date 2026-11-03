@@ -1059,6 +1059,9 @@ def build_ai_check_prompt(
             "process（数据处理）参数只允许：" + allowed
             + "；每个数据组返回独立参数，name 必须与证据中的组名完全一致。"
             "parameters 里只写你建议修改的键，不修改的键直接省略（不要写 null）。\n"
+            "rbkg 约取第一壳距离的一半（第一壳距离 ≈ 1 Å 以上最高 |χ(R)| 峰的位置 + 0.4 Å），"
+            "不要超过它的 0.55 倍。不要为了压低 R < 1 Å 的残峰而加大 rbkg：那常常是第一壳峰的低 R 侧肩，"
+            "不是背景。后边归一化 nnorm 默认 2（二次）；不要建议 3。\n"
             "fit（拟合）只给 GDS 行补丁（name/value/kind/expr/min/max）与 FEFF 只读文字建议；"
             "禁止 FEFF 路径参数、命令或文件路径。\n"
             "证据里的 structure_models、available_paths、budget、model_comparisons 分别描述结构模型"
@@ -1086,6 +1089,10 @@ def build_ai_check_prompt(
             "process (data processing) parameters may use only: " + allowed
             + "; return independent parameters per dataset and preserve each exact dataset name. "
             "In parameters write only the keys you want to change and omit the rest (do not write null).\n"
+            "Set rbkg to about half the first-shell distance (≈ the highest |chi(R)| peak above 1 A "
+            "plus 0.4 A) and never above 0.55 of it. Do not raise rbkg just to suppress features "
+            "below 1 A: they are often the low-R shoulder of the first-shell peak, not background. "
+            "Use nnorm 2 (quadratic) for the post-edge; do not suggest 3.\n"
             "fit may contain GDS row patches (name/value/kind/expr/min/max) and read-only FEFF "
             "text advice; never emit FEFF path patches, commands, or file paths.\n"
             "Evidence fields structure_models, available_paths, budget and model_comparisons give "
